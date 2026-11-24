@@ -10,9 +10,11 @@ arboard = { version = "3.7.0", default-features = false, features = ["wayland-da
 chardetng = "1.0.0"
 clap = { version = "4.6.9", features = ["derive"] }
 encoding_rs = "0.8.44"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 linkify = "0.12.0"
 pulldown-cmark = { version = "0.13.6", default-features = false }
 ratatui = "0.30.2"
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 regex = "1.13.2"
 ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "regex-fancy"] }
@@ -31,4 +33,5 @@ strip = true
 tempfile = "3.27.0"
 
 [target."cfg(unix)".dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "event", "termios", "stdio"] }
 signal-hook = { version = "0.3", default-features = false }

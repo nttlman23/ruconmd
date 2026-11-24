@@ -67,6 +67,13 @@ impl Terminal {
         Ok(Self { inner })
     }
 
+    /// Стирает экран, следующая отрисовка выведет его целиком.
+    pub fn clear(&mut self) -> io::Result<()> {
+        // `clear()` спросил бы позицию курсора, а ответ перехватил бы поток ввода.
+        let area = self.inner.size()?.into();
+        self.inner.resize(area)
+    }
+
     pub fn draw(&mut self, render: impl FnOnce(&mut Frame)) -> io::Result<()> {
         self.inner.draw(render).map(|_| ())
     }

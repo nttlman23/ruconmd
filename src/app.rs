@@ -19,13 +19,14 @@ use crate::config::{Config, Warning};
 use crate::dialog::{Action, Ask, Dialog, Field, Location, Menu, Outcome, SaveJob, Then};
 use crate::encoding::{self, Enc, Format, Unencodable};
 use crate::file::{self, Disk, ReadError};
+use crate::graphics::{Graphics, Wanted};
 use crate::i18n::Lang;
 use crate::input::Input;
 use crate::key::{Chord, Key};
 use crate::keymap::Keymap;
 use crate::links::Opener;
 use crate::mdline::States;
-use crate::pane::Pane;
+use crate::pane::{Pane, Shown};
 use crate::recovery::{Orphan, Recovery};
 use crate::search::{Query, Search};
 use crate::style::Theme;
@@ -92,6 +93,7 @@ pub struct App {
     autosave: Option<Duration>,
     autosave_state: Option<protect::Autosave>,
     preview_width: usize,
+    pub wanted_images: Wanted,
     clipboard: Box<dyn Clipboard>,
     opener: Box<dyn Opener>,
     /// Поиск, совпадения которого подсвечены.
@@ -197,6 +199,7 @@ impl App {
             autosave: config.autosave,
             autosave_state: None,
             preview_width: config.preview_width,
+            wanted_images: config.images,
             clipboard,
             opener,
             search: None,
@@ -209,6 +212,7 @@ impl App {
             follow: true,
             dragging: false,
         };
+        app.pane.reset(app.path.clone());
         app.set_content(loaded);
         if let Some(line) = options.line {
             app.goto_line(line);
@@ -283,6 +287,22 @@ impl App {
         self.pane.prepare(&self.buffer, width, height, tab);
         self.pane.set_search(self.search.as_ref());
         self.pane.highlight(Instant::now() + HIGHLIGHT_BUDGET);
+        self.pane.load_images();
+    }
+
+    pub fn set_graphics(&mut self, graphics: Option<Graphics>) {
+        self.pane.set_graphics(graphics);
+    }
+
+    /// Картинки, которые будут на экране. Под окнами они не рисуются.
+    pub fn images_on_screen(&self) -> Vec<Shown> {
+        let covered = self.help || matches!(self.dialog, Some(Dialog::Menu(_)));
+        if self.mode != Mode::View || covered || self.pane.graphics().is_none() {
+            return Vec::new();
+        }
+        let mut shown = self.pane.shown_images();
+        shown.retain(|s| self.pane.picture(s.image).is_some());
+        shown
     }
 
     /// Нужна отрисовка, даже если пользователь ничего не нажимает.

@@ -12,7 +12,9 @@ line_numbers = true
 
 [preview]
 max_width = 100          # 0 = вся ширина окна, иначе не меньше 20
-images = true
+images = true            # true (определить по терминалу), false,
+                         # "kitty", "sixel" или "iterm2" (без проверки терминала).
+                         # В Windows картинки включаются только так: "sixel"
 
 [save]
 backup = true            # файл .bak при первом сохранении за сеанс

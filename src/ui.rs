@@ -4,7 +4,8 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget};
+use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -221,6 +222,7 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
         }
     };
     let selected = app.pane.selected_id();
+    let on_screen = app.images_on_screen();
     for (row, line) in app.pane.visible().iter().enumerate() {
         let y = area.y + row as u16;
         let mut x = area.x + MARGIN;
@@ -239,6 +241,16 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
             put(&mut x, y, &span.text, &|byte| found(style, offset + byte));
             offset += span.text.len();
         }
+        // Место картинки, которой ещё нет.
+        if let Some(part) = line.image
+            && part.row == 0
+            && !on_screen.iter().any(|s| s.image == part.image)
+        {
+            let (alt, failed) = app.pane.image_note(part.image);
+            let note = if failed { "✗" } else { "…" };
+            let style = app.theme.style(Mark::tone(Tone::Dim));
+            put(&mut x, y, &format!("▣ {alt} {note}"), &|_| style);
+        }
         if let Some(text) = app.pane.code_text(line) {
             put(&mut x, y, text, &|byte| {
                 found(
@@ -246,6 +258,18 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
                     offset + byte,
                 )
             });
+        }
+    }
+    for place in on_screen {
+        if let Some(picture) = app.pane.picture(place.image) {
+            let x = place.x.min(area.width);
+            let target = Rect {
+                x: area.x + x,
+                width: area.width - x,
+                ..area
+            };
+            let position = SignedPosition { x: 0, y: place.y };
+            SlicedImage::new(picture, position).render(target, buf);
         }
     }
 }

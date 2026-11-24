@@ -1,7 +1,7 @@
 use super::*;
 
 fn doc(text: &str, width: usize) -> Doc {
-    Doc::build(text, width, 4)
+    Doc::build(text, width, 4, None)
 }
 
 fn shown(doc: &Doc) -> Vec<String> {
@@ -225,7 +225,7 @@ fn images_footnotes_html_math_and_metadata() {
     let want = [
         "title: x",
         "",
-        "▣ кот (cat.png) сноска[1] <b>html</b> $x^2$",
+        "▣ кот (cat.png) сноска[1] <b>html</b> x²",
         "",
         "[1] Пояснение",
         "",
@@ -331,4 +331,98 @@ fn wrapped_lines_know_how_they_join() {
     use Join::*;
     assert_eq!(joins, [New, Space, New, New, Glue, New, New, Glue]);
     assert_eq!(d.lines[1].prefix, 1);
+}
+
+#[test]
+fn formulas() {
+    assert_eq!(
+        render("при $x \\to 0$ и $\\foo$", 80),
+        ["при x → 0 и $\\foo$"]
+    );
+    let text = "текст\n$$\n\\frac{a}{b}\n$$\nдальше";
+    assert_eq!(render(text, 80), ["текст", "    a/b", "дальше"]);
+    let text = "$$\\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix}$$";
+    assert_eq!(render(text, 80), ["    ⎛1  2⎞", "    ⎝3  4⎠"]);
+    assert_eq!(
+        render("```math\nx^2\n```\n\nтекст", 80),
+        ["    x²", "", "текст"]
+    );
+    assert_eq!(
+        render("```math\n\\foo\n```", 80),
+        ["┌─ math", "│ \\foo", "└─"]
+    );
+    assert_eq!(render("$$\\foo$$", 80), ["    $$\\foo$$"]);
+    let table = "| a |\n|---|\n| $x_1$ |\n";
+    assert_eq!(render(table, 80)[3], "│ x₁ │");
+    assert_eq!(render("цена $5 и $10", 80), ["цена $5 и $10"]);
+}
+
+mod images {
+    use super::*;
+    use crate::graphics::tests::{kitty, picture};
+
+    fn with_pictures(text: &str, width: usize) -> Doc {
+        let dir = tempfile::tempdir().unwrap();
+        picture(&dir.path().join("a.png"), 100, 60);
+        picture(&dir.path().join("широкая.png"), 2000, 200);
+        let images = Images {
+            graphics: kitty(),
+            document: Some(dir.path().join("doc.md")),
+        };
+        Doc::build(text, width, 4, Some(&images))
+    }
+
+    fn rows(d: &Doc) -> usize {
+        d.lines.iter().filter(|l| l.image.is_some()).count()
+    }
+
+    #[test]
+    fn picture_takes_rows_and_has_a_caption() {
+        let d = with_pictures("до\n\n![кот](a.png)\n\nпосле", 80);
+        assert_eq!(shown(&d), ["до", "", "", "", "", "кот", "", "после"]);
+        assert_eq!(
+            (d.images[0].columns, d.images[0].rows, rows(&d)),
+            (10, 3, 3)
+        );
+        assert!(d.lines.is_sorted_by_key(|l| l.src));
+        let d = with_pictures("![](%D1%88%D0%B8%D1%80%D0%BE%D0%BA%D0%B0%D1%8F.png)", 40);
+        assert_eq!((d.images[0].columns, d.images[0].rows), (40, 2));
+        assert_eq!(d.lines.len(), 2, "no caption without alt text");
+    }
+
+    #[test]
+    fn several_pictures_and_prefixes() {
+        let d = with_pictures("> ![один](a.png)\n> ![нет](none.png)\n> ![два](a.png)", 80);
+        let text = shown(&d);
+        assert_eq!(rows(&d), 6);
+        assert!(text.iter().all(|l| l.starts_with('▌')));
+        assert!(text.contains(&"▌ ▣ нет (none.png)".to_owned()));
+        assert_eq!(text.last().unwrap(), "▌ два");
+    }
+
+    #[test]
+    fn linked_picture_can_be_selected() {
+        let d = with_pictures("[![](a.png)](https://a.ru)", 80);
+        assert_eq!(rows(&d), 3);
+        assert_eq!(d.items, [Item::Link("https://a.ru".into())]);
+        assert_eq!(d.order.len(), 1);
+    }
+
+    #[test]
+    fn text_remains_text() {
+        for text in [
+            "слово ![кот](a.png)",
+            "![кот](none.png)",
+            "![кот](https://a.ru/a.png)",
+            "![кот](file:///a.png)",
+            "![кот](//server/a.png)",
+            "![кот](data:image/png;base64,AAAA)",
+            "| ![кот](a.png) |\n|---|\n",
+            "# ![кот](a.png)",
+        ] {
+            let d = with_pictures(text, 80);
+            assert_eq!(rows(&d), 0, "{text}");
+            assert!(shown(&d).join("\n").contains("▣ кот"), "{text}");
+        }
+    }
 }

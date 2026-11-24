@@ -13,10 +13,11 @@ use crate::app::{App, Options};
 use crate::clipboard;
 use crate::command::Mode;
 use crate::encoding::Enc;
+use crate::graphics::Graphics;
 use crate::i18n::Lang;
 use crate::style::Depth;
 use crate::term::{Events, Terminal};
-use crate::{code, config, diag, links, ui};
+use crate::{code, config, diag, graphics, links, ui};
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -83,10 +84,25 @@ pub fn run() -> io::Result<()> {
 
 fn event_loop(app: &mut App, stop: &AtomicBool) -> io::Result<End> {
     let mut terminal = Terminal::enter(true)?;
+    let env = graphics::Env::from_system();
+    let answers = if graphics::worth_asking(app.wanted_images, &env) {
+        graphics::ask()
+    } else {
+        graphics::Answers::default()
+    };
+    app.set_graphics(graphics::choose(app.wanted_images, &env, answers));
     let events = Events::start();
+    let mut drawn = Vec::new();
     while !app.should_quit {
         app.tick(Instant::now());
         terminal.draw(|frame| ui::draw(frame, app))?;
+        // Прежнее место картинки само не стирается.
+        let traces = app.pane.graphics().is_some_and(Graphics::leaves_traces);
+        if traces && drawn != app.images_on_screen() && !drawn.is_empty() {
+            terminal.clear()?;
+            terminal.draw(|frame| ui::draw(frame, app))?;
+        }
+        drawn = app.images_on_screen();
         // Всё, что уже накопилось, обрабатывается до следующей отрисовки.
         let mut timeout = app.sleep();
         while let Some(batch) = events.next(timeout)? {

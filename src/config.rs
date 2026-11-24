@@ -11,6 +11,7 @@ use std::time::Duration;
 use toml::{Table, Value};
 
 use crate::command::Command;
+use crate::graphics::Wanted;
 use crate::i18n::Lang;
 use crate::key::Chord;
 use crate::keymap::{BindError, Keymap};
@@ -25,7 +26,7 @@ pub struct Config {
     pub editor: Settings,
     /// Наибольшая ширина просмотра, 0: вся ширина окна.
     pub preview_width: usize,
-    pub images: bool,
+    pub images: Wanted,
     pub backup: bool,
     /// Через сколько после правки сохранять файл.
     pub autosave: Option<Duration>,
@@ -39,7 +40,7 @@ impl Default for Config {
             theme: Theme::DARK,
             editor: Settings::default(),
             preview_width: 100,
-            images: true,
+            images: Wanted::Auto,
             backup: true,
             autosave: None,
             keymap: Keymap::default(),
@@ -202,7 +203,14 @@ impl Reader {
                     let width = number(v, 0, 1000).filter(|n| *n == 0 || *n >= 20);
                     self.set(&place, width, |c, n| c.preview_width = n);
                 }
-                "images" => self.set(&place, v.as_bool(), |c, b| c.images = b),
+                "images" => {
+                    let wanted = match v {
+                        Value::Boolean(true) => Some(Wanted::Auto),
+                        Value::Boolean(false) => Some(Wanted::Off),
+                        other => other.as_str().and_then(Wanted::from_name),
+                    };
+                    self.set(&place, wanted, |c, w| c.images = w);
+                }
                 _ => self.warn(place, Problem::Unknown),
             }
         }
@@ -403,8 +411,19 @@ mod tests {
             (c.editor.tab_width, c.editor.wrap, c.editor.line_numbers),
             (2, false, false)
         );
-        assert_eq!((c.preview_width, c.images, c.backup), (0, false, false));
+        assert_eq!(
+            (c.preview_width, c.images, c.backup),
+            (0, Wanted::Off, false)
+        );
         assert_eq!(c.autosave, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn image_protocols() {
+        let images = |v: &str| parse(&format!("[preview]\nimages = {v}\n")).0.images;
+        assert_eq!(images("true"), Wanted::Auto);
+        assert_eq!(Some(images("\"sixel\"")), Wanted::from_name("sixel"));
+        assert_eq!(problems("[preview]\nimages = \"png\"\n").len(), 1);
     }
 
     #[test]

@@ -161,7 +161,7 @@ mod tests {
     use std::time::Duration;
 
     fn tones(lang: &str, code: &str, line: u32, words: &[&str]) -> Vec<Tone> {
-        let doc = Doc::build(&format!("```{lang}\n{code}\n```\n"), 80, 4);
+        let doc = Doc::build(&format!("```{lang}\n{code}\n```\n"), 80, 4, None);
         let mut h = Highlighter::default();
         let deadline = Instant::now() + Duration::from_secs(60);
         assert!(h.prepare(&doc, 0, line, deadline));
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn stops_at_the_deadline_and_continues_later() {
-        let doc = Doc::build("```rust\nlet a = 1;\nlet b = 2;\n```\n", 80, 4);
+        let doc = Doc::build("```rust\nlet a = 1;\nlet b = 2;\n```\n", 80, 4, None);
         let mut h = Highlighter::default();
         assert!(!h.prepare(&doc, 0, 1, Instant::now()));
         assert_eq!(h.tone(0, 1, 0), Tone::Text);

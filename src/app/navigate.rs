@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use super::{App, Mode, load};
 use crate::dialog::{Action, Dialog, Location, Menu, Spot, Then};
 use crate::links::{self, Target};
-use crate::pane::Pane;
 use crate::preview::{self, Item};
 
 impl App {
@@ -154,7 +153,7 @@ impl App {
             }
             match load(path, None, self.lang) {
                 Ok(loaded) => {
-                    self.pane = Pane::default();
+                    self.pane.reset(Some(path.clone()));
                     self.open_other(path.clone(), loaded);
                 }
                 Err(e) => {

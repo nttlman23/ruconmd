@@ -301,6 +301,10 @@ impl App {
     pub(super) fn after_write(&mut self, path: &Path, bytes: &[u8]) {
         let renamed = self.path.as_deref() != Some(path);
         self.path = Some(path.to_owned());
+        if renamed {
+            // Пути картинок считаются от нового места.
+            self.pane.reset(Some(path.to_owned()));
+        }
         self.disk = Disk::after_write(path, bytes);
         self.disk_differs = false;
         if renamed && let Some(r) = &mut self.recovery {

@@ -31,25 +31,39 @@ pub fn parse(url: &str, document: Option<&Path>) -> Target {
             _ => Target::Unsupported,
         };
     }
-    // Сетевой путь заставил бы Windows обратиться к чужому серверу.
-    if url.starts_with("//") || url.starts_with("\\\\") {
-        return Target::Unsupported;
-    }
     let (path, anchor) = match url.split_once('#') {
         Some((path, anchor)) => (path, Some(decode(anchor))),
         None => (url, None),
     };
-    let path = decode(path);
-    if path.starts_with("//") || path.contains("\\\\") || path.contains(char::is_control) {
+    let Some(path) = local_path(path, document) else {
         return Target::Unsupported;
-    }
-    let path = PathBuf::from(path);
+    };
     let extension = path.extension().map(|e| e.to_string_lossy().to_lowercase());
     if !matches!(extension.as_deref(), Some("md" | "markdown")) {
         return Target::Unsupported;
     }
+    Target::File(path, anchor)
+}
+
+/// Путь к файлу рядом с документом. `None` для адресов и сетевых путей.
+pub fn local_path(url: &str, document: Option<&Path>) -> Option<PathBuf> {
+    let url = url.trim();
+    if url.is_empty() || scheme(url).is_some() || is_network(url) {
+        return None;
+    }
+    let path = decode(url);
+    if is_network(&path) || path.contains(char::is_control) {
+        return None;
+    }
     let base = document.and_then(Path::parent).unwrap_or(Path::new(""));
-    Target::File(base.join(path), anchor)
+    Some(base.join(path))
+}
+
+/// Сетевой путь заставил бы Windows обратиться к чужому серверу.
+fn is_network(path: &str) -> bool {
+    let mut start = path.chars().take(2);
+    let slash = |c: Option<char>| matches!(c, Some('/' | '\\'));
+    (slash(start.next()) && slash(start.next())) || path.contains("\\\\")
 }
 
 /// Схема адреса. Одна буква перед двоеточием: диск Windows, а не схема.
@@ -173,6 +187,8 @@ mod tests {
             "\\\\server\\share\\a.md",
             "%5C%5Cserver%5Ca.md",
             "/%2Fserver/a.md",
+            "/\\\\server/a.md",
+            "\\\\/server/a.md",
             "http://a.ru/\u{1b}[31m",
             "a%00.md",
             "vbscript:x.md",

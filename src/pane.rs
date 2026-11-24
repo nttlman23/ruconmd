@@ -1,13 +1,17 @@
 //! Область просмотра: построение в фоне, прокрутка, связь с местом в тексте.
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
 
+use ratatui_image::sliced::SlicedProtocol;
 use ropey::Rope;
 
 use crate::buffer::Buffer;
 use crate::code::Highlighter;
+use crate::graphics::{Graphics, Images};
 use crate::layout;
 use crate::preview::{Doc, Item, Join, Line};
 use crate::search::{Query, Search};
@@ -49,6 +53,30 @@ pub struct Pane {
     found: Option<Found>,
     /// Куда был переход, пока пользователь не прокрутил дальше.
     focus: Option<usize>,
+    graphics: Option<Graphics>,
+    /// Документ, от которого считаются пути картинок.
+    document: Option<PathBuf>,
+    pictures: HashMap<u32, Picture>,
+}
+
+/// Картинка на пути к экрану.
+enum Picture {
+    Loading(Receiver<Option<SlicedProtocol>>),
+    Ready(Box<SlicedProtocol>),
+    Failed,
+}
+
+/// Столько картинок хранится готовыми, невидимые сверх этого выгружаются.
+const KEEP_PICTURES: usize = 16;
+
+/// Видимая картинка: номер, отступ слева, строка экрана её начала (может быть
+/// выше края) и сколько её строк видно.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shown {
+    pub image: u32,
+    pub x: u16,
+    pub y: i16,
+    pub rows: u16,
 }
 
 /// Кусок текста поиска: откуда он в просмотре.
@@ -136,20 +164,114 @@ impl Default for Pane {
             selected: None,
             found: None,
             focus: None,
+            graphics: None,
+            document: None,
+            pictures: HashMap::new(),
         }
     }
 }
 
-fn spawn(rope: Rope, width: usize, tab: usize) -> Receiver<Doc> {
+fn spawn(rope: Rope, width: usize, tab: usize, images: Option<Images>) -> Receiver<Doc> {
     let (sender, receiver) = channel();
     std::thread::spawn(move || {
         // Получателя может уже не быть: режим сменили или программу закрыли.
-        let _ = sender.send(Doc::build(&rope.to_string(), width, tab));
+        let _ = sender.send(Doc::build(&rope.to_string(), width, tab, images.as_ref()));
     });
     receiver
 }
 
 impl Pane {
+    /// Пустой просмотр для другого документа в том же терминале.
+    pub fn reset(&mut self, document: Option<PathBuf>) {
+        *self = Self {
+            graphics: self.graphics.take(),
+            document,
+            ..Self::default()
+        };
+    }
+
+    pub fn set_graphics(&mut self, graphics: Option<Graphics>) {
+        self.graphics = graphics;
+    }
+
+    pub fn graphics(&self) -> Option<&Graphics> {
+        self.graphics.as_ref()
+    }
+
+    fn images(&self) -> Option<Images> {
+        Some(Images {
+            graphics: self.graphics.clone()?,
+            document: self.document.clone(),
+        })
+    }
+
+    /// Видимые картинки сверху вниз.
+    pub fn shown_images(&self) -> Vec<Shown> {
+        let mut out: Vec<Shown> = Vec::new();
+        for (y, line) in self.visible().iter().enumerate() {
+            let Some(part) = line.image else { continue };
+            match out.last_mut() {
+                Some(last) if last.image == part.image => last.rows += 1,
+                _ => {
+                    let prefix: usize = line.spans.iter().map(|s| layout::width(&s.text, 4)).sum();
+                    out.push(Shown {
+                        image: part.image,
+                        x: MARGIN + prefix as u16,
+                        y: y as i16 - part.row as i16,
+                        rows: 1,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Загружает видимые картинки и забирает готовые.
+    pub fn load_images(&mut self) {
+        let Some(graphics) = &self.graphics else {
+            return;
+        };
+        let shown = self.shown_images();
+        if self.pictures.len() > KEEP_PICTURES {
+            self.pictures
+                .retain(|id, _| shown.iter().any(|s| s.image == *id));
+        }
+        for place in &shown {
+            let image = &self.doc.images[place.image as usize];
+            self.pictures.entry(place.image).or_insert_with(|| {
+                let (sender, receiver) = channel();
+                let (graphics, image) = (graphics.clone(), image.clone());
+                std::thread::spawn(move || {
+                    let _ = sender.send(graphics.encode(&image.path, image.columns, image.rows));
+                });
+                Picture::Loading(receiver)
+            });
+        }
+        for picture in self.pictures.values_mut() {
+            if let Picture::Loading(receiver) = picture {
+                match receiver.try_recv() {
+                    Ok(Some(ready)) => *picture = Picture::Ready(Box::new(ready)),
+                    // Поток мог и упасть на испорченном файле.
+                    Ok(None) | Err(TryRecvError::Disconnected) => *picture = Picture::Failed,
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+        }
+    }
+
+    pub fn picture(&self, image: u32) -> Option<&SlicedProtocol> {
+        match self.pictures.get(&image)? {
+            Picture::Ready(ready) => Some(ready),
+            Picture::Loading(_) | Picture::Failed => None,
+        }
+    }
+
+    /// Подпись на месте картинки, пока её нет, и признак ошибки.
+    pub fn image_note(&self, image: u32) -> (&str, bool) {
+        let failed = matches!(self.pictures.get(&image), Some(Picture::Failed));
+        (&self.doc.images[image as usize].alt, failed)
+    }
+
     /// Показать место исходного текста на заданной строке экрана.
     pub fn show(&mut self, src: usize, row: usize) {
         self.anchor = Some(Anchor { src, row });
@@ -168,10 +290,11 @@ impl Pane {
         self.wanted = Some(key);
         if self.shown != Some(key) && self.job.is_none() {
             if buffer.byte_len() <= SYNC_BYTES {
-                let doc = Doc::build(&buffer.text(), width, tab);
+                let images = self.images();
+                let doc = Doc::build(&buffer.text(), width, tab, images.as_ref());
                 self.accept(key, doc);
             } else {
-                self.job = Some((key, spawn(buffer.rope(), width, tab)));
+                self.job = Some((key, spawn(buffer.rope(), width, tab, self.images())));
             }
         }
         self.poll();
@@ -211,6 +334,10 @@ impl Pane {
         if self.anchor.is_none() && self.shown.is_some() && !same_shape {
             let src = self.source_at_top();
             self.anchor = Some(Anchor { src, row: 0 });
+        }
+        // Те же картинки заново не загружаются.
+        if self.doc.images != doc.images {
+            self.pictures.clear();
         }
         self.doc = doc;
         self.shown = Some(key);
@@ -359,7 +486,8 @@ impl Pane {
 
     /// Нужна повторная отрисовка без участия пользователя.
     pub fn is_busy(&self) -> bool {
-        self.job.is_some() || self.unfinished
+        let loading = |p: &Picture| matches!(p, Picture::Loading(_));
+        self.job.is_some() || self.unfinished || self.pictures.values().any(loading)
     }
 
     pub fn is_scrolled(&self) -> bool {

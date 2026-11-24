@@ -5,19 +5,23 @@ mod table;
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::path::PathBuf;
 
 use pulldown_cmark::{
     BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
 
+use crate::graphics::{self, Images};
 use crate::layout;
 use crate::links;
 use crate::style::{Mark, Tone};
+use crate::tex;
 use inline::Inline;
 use table::Table;
 
 /// Меньше этого содержимое не сужается, лишнее обрезается краем экрана.
 const MIN_CONTENT: usize = 4;
+const DISPLAY_INDENT: &str = "    ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Span {
@@ -75,8 +79,26 @@ pub struct Line {
     pub prefix: usize,
     pub join: Join,
     pub code: Option<CodeRef>,
+    pub image: Option<ImageRef>,
     /// Байт исходного текста, которому соответствует начало строки.
     pub src: usize,
+}
+
+/// Строка картинки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageRef {
+    pub image: u32,
+    pub row: u16,
+}
+
+/// Картинка, для которой в просмотре оставлено место.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    pub path: PathBuf,
+    pub columns: u16,
+    pub rows: u16,
+    /// Что показать, если картинку не удалось прочитать.
+    pub alt: String,
 }
 
 #[derive(Debug, Default)]
@@ -93,11 +115,13 @@ pub struct Doc {
     /// Выбираемое в порядке показа: номер и первая строка.
     pub order: Vec<(u32, usize)>,
     pub code: Vec<CodeBlock>,
+    pub images: Vec<Image>,
 }
 
 impl Doc {
-    pub fn build(text: &str, width: usize, tab: usize) -> Self {
-        let mut builder = Builder::new(width.max(1), tab);
+    /// `images`: `None`, если терминал не показывает картинки.
+    pub fn build(text: &str, width: usize, tab: usize, images: Option<&Images>) -> Self {
+        let mut builder = Builder::new(width.max(1), tab, images);
         for (event, range) in Parser::new_ext(text, options()).into_offset_iter() {
             builder.event(event, range);
         }
@@ -134,7 +158,9 @@ impl Doc {
 
 impl Line {
     fn is_blank(&self) -> bool {
-        self.code.is_none() && self.spans.iter().all(|s| s.text.trim().is_empty())
+        self.code.is_none()
+            && self.image.is_none()
+            && self.spans.iter().all(|s| s.text.trim().is_empty())
     }
 }
 
@@ -217,7 +243,23 @@ struct List {
     loose: bool,
 }
 
-struct Builder {
+/// Картинка внутри абзаца.
+struct Picture {
+    url: String,
+    alt: String,
+    item: Option<u32>,
+    src: usize,
+}
+
+/// Абзац, который может состоять из одних картинок.
+#[derive(Default)]
+struct Pictures {
+    list: Vec<Picture>,
+    /// Есть и другой текст.
+    mixed: bool,
+}
+
+struct Builder<'a> {
     doc: Doc,
     width: usize,
     tab: usize,
@@ -236,10 +278,14 @@ struct Builder {
     heading: Option<HeadingLevel>,
     /// Начало текущего блока.
     src: usize,
+    graphics: Option<&'a Images>,
+    pictures: Pictures,
+    /// После выключной формулы текст начинается с новой строки.
+    after_display: bool,
 }
 
-impl Builder {
-    fn new(width: usize, tab: usize) -> Self {
+impl<'a> Builder<'a> {
+    fn new(width: usize, tab: usize, images: Option<&'a Images>) -> Self {
         Self {
             doc: Doc::default(),
             width,
@@ -257,6 +303,9 @@ impl Builder {
             raw: None,
             heading: None,
             src: 0,
+            graphics: images,
+            pictures: Pictures::default(),
+            after_display: false,
         }
     }
 
@@ -291,11 +340,11 @@ impl Builder {
             },
             Event::Code(text) => self.push(&text, Mark::tone(Tone::Code), range.start),
             Event::InlineMath(text) => {
-                self.push(&format!("${text}$"), Mark::tone(Tone::Code), range.start);
+                let shown = tex::convert_inline(&text).unwrap_or_else(|| format!("${text}$"));
+                self.push(&shown, Mark::tone(Tone::Code), range.start);
             }
             Event::DisplayMath(text) => {
-                let text = text.replace(['\r', '\n'], " ");
-                self.push(&format!("$${text}$$"), Mark::tone(Tone::Code), range.start);
+                self.display(&text, range.start);
             }
             Event::Html(text) => match &mut self.raw {
                 Some(raw) => raw.push_str(&text),
@@ -308,6 +357,8 @@ impl Builder {
             Event::FootnoteReference(label) => {
                 self.push(&format!("[{label}]"), Mark::tone(Tone::Link), range.start);
             }
+            // Перенос после выключной формулы уже сделан.
+            Event::SoftBreak if self.after_display => {}
             Event::SoftBreak => self.push(" ", Mark::TEXT, range.start),
             Event::HardBreak => self.push("\n", Mark::TEXT, range.start),
             Event::Rule => {
@@ -327,6 +378,7 @@ impl Builder {
                     list.loose = true;
                 }
                 self.begin(src);
+                self.pictures = Pictures::default();
             }
             Tag::Heading { level, .. } => {
                 self.begin(src);
@@ -397,7 +449,13 @@ impl Builder {
             }
             Tag::Image { dest_url, .. } => {
                 self.marks.push(Mark::tone(Tone::Link));
-                self.push("▣ ", Mark::TEXT, src);
+                self.add_text("▣ ", Mark::TEXT, src);
+                self.pictures.list.push(Picture {
+                    url: dest_url.to_string(),
+                    alt: String::new(),
+                    item: self.item,
+                    src,
+                });
                 self.images.push(dest_url.into_string());
             }
             _ => {}
@@ -407,7 +465,9 @@ impl Builder {
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Paragraph => {
-                self.flush();
+                if !self.show_pictures() {
+                    self.flush();
+                }
                 self.need_blank = true;
             }
             TagEnd::Heading(level) => {
@@ -460,6 +520,7 @@ impl Builder {
                 self.need_blank = true;
             }
             TagEnd::TableCell => {
+                self.after_display = false;
                 let mut cell = std::mem::take(&mut self.inline);
                 cell.find_links(&mut self.doc.items);
                 if let Some(table) = &mut self.table {
@@ -476,7 +537,7 @@ impl Builder {
             TagEnd::Image => {
                 if let Some(dest) = self.images.pop() {
                     // Адрес нужен, пока сама картинка не показана.
-                    self.push(&format!(" ({dest})"), Mark::tone(Tone::Dim), self.src);
+                    self.add_text(&format!(" ({dest})"), Mark::tone(Tone::Dim), self.src);
                 }
                 self.marks.pop();
             }
@@ -487,6 +548,18 @@ impl Builder {
     // --- Строчное содержимое ---
 
     fn push(&mut self, text: &str, mark: Mark, src: usize) {
+        if self.images.is_empty() {
+            self.pictures.mixed |= !text.trim().is_empty();
+        } else if let Some(picture) = self.pictures.list.last_mut() {
+            picture.alt.push_str(text);
+        }
+        self.add_text(text, mark, src);
+    }
+
+    fn add_text(&mut self, text: &str, mark: Mark, src: usize) {
+        if std::mem::take(&mut self.after_display) && !self.inline.is_empty() {
+            self.inline.push("\n", Mark::TEXT, None, src);
+        }
         let outer = self.marks.iter().fold(Mark::TEXT, |a, b| a.with(*b));
         self.inline.push(text, outer.with(mark), self.item, src);
     }
@@ -496,8 +569,93 @@ impl Builder {
         self.doc.items.len() as u32 - 1
     }
 
+    /// Выключная формула занимает свои строки.
+    fn display(&mut self, text: &str, src: usize) {
+        let lines = tex::convert(text).unwrap_or_else(|| {
+            let text = text.trim().replace(['\r', '\n'], " ");
+            vec![format!("$${text}$$")]
+        });
+        if !self.inline.is_empty() {
+            self.add_text("\n", Mark::TEXT, src);
+        }
+        self.after_display = false;
+        for (number, line) in lines.iter().enumerate() {
+            let separator = if number > 0 { "\n" } else { "" };
+            let text = format!("{separator}{DISPLAY_INDENT}{line}");
+            self.push(&text, Mark::tone(Tone::Code), src);
+        }
+        self.after_display = true;
+    }
+
+    /// Показывает картинки абзаца, в котором нет ничего другого.
+    fn show_pictures(&mut self) -> bool {
+        let pictures = std::mem::take(&mut self.pictures);
+        let Some(images) = self.graphics else {
+            return false;
+        };
+        if pictures.mixed {
+            return false;
+        }
+        let available = self.available();
+        let sized: Vec<_> = pictures
+            .list
+            .iter()
+            .map(|p| {
+                let path = links::local_path(&p.url, images.document.as_deref())?;
+                let (columns, rows) = images
+                    .graphics
+                    .cells(graphics::dimensions(&path)?, available);
+                Some((path, columns, rows))
+            })
+            .collect();
+        if sized.iter().all(Option::is_none) {
+            return false;
+        }
+        self.inline = Inline::default();
+        for (picture, place) in pictures.list.iter().zip(sized) {
+            let mark = match picture.item {
+                Some(_) => Mark::tone(Tone::Link).underline(),
+                None => Mark::tone(Tone::Dim),
+            };
+            let Some((path, columns, rows)) = place else {
+                let text = format!("▣ {} ({})", picture.alt, picture.url);
+                self.inline.push(&text, mark, picture.item, picture.src);
+                self.flush();
+                continue;
+            };
+            let image = self.doc.images.len() as u32;
+            for row in 0..rows {
+                let spans = self.prefix_spans();
+                self.doc.lines.push(Line {
+                    prefix: spans.len(),
+                    spans,
+                    join: Join::New,
+                    code: None,
+                    image: Some(ImageRef { image, row }),
+                    src: picture.src,
+                });
+            }
+            self.doc.images.push(Image {
+                path,
+                columns,
+                rows,
+                alt: picture.alt.clone(),
+            });
+            // Подпись нужна для поиска и чтобы ссылку можно было выбрать.
+            let caption = match (&picture.alt, picture.item) {
+                (alt, _) if !alt.trim().is_empty() => alt.as_str(),
+                (_, Some(_)) => picture.url.as_str(),
+                _ => continue,
+            };
+            self.inline.push(caption, mark, picture.item, picture.src);
+            self.flush();
+        }
+        true
+    }
+
     /// Выводит накопленный абзац.
     fn flush(&mut self) {
+        self.after_display = false;
         if self.inline.is_empty() {
             return;
         }
@@ -529,6 +687,7 @@ impl Builder {
                 spans,
                 join: Join::New,
                 code: None,
+                image: None,
                 src,
             });
         }
@@ -636,6 +795,7 @@ impl Builder {
             prefix,
             join,
             code: None,
+            image: None,
             src,
         });
     }
@@ -658,6 +818,15 @@ impl Builder {
     fn emit_code(&mut self) {
         let raw = self.raw.take().unwrap_or_default();
         let mut block = self.code.take().unwrap_or_default();
+        if block.lang == "math"
+            && let Some(lines) = tex::convert(&raw)
+        {
+            for line in lines {
+                let span = Span::new(format!("{DISPLAY_INDENT}{line}"), Mark::tone(Tone::Code));
+                self.emit(vec![span], self.src);
+            }
+            return;
+        }
         let dim = Mark::tone(Tone::Dim);
         let top = if block.lang.is_empty() {
             "┌─".into()
@@ -685,6 +854,7 @@ impl Builder {
                         line: number as u32,
                         bytes: row.byte_start..row.byte_end,
                     }),
+                    image: None,
                     src,
                 });
             }
