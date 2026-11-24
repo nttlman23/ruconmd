@@ -52,9 +52,21 @@ impl Source for Http {
             .user_agent(concat!("ruconmd/", env!("CARGO_PKG_VERSION")))
             .build()
             .new_agent();
-        let mut response = agent.get(url).call().map_err(|e| e.to_string())?;
+        // Имя сервера и прокси: из текста самой ошибки не видно, что не нашлось.
+        let via = agent.config().proxy().map(|p| (p.host(), p.port()));
+        let explain = |e: ureq::Error| explain(url, via, &e.to_string());
+        let mut response = agent.get(url).call().map_err(explain)?;
         let body = response.body_mut().with_config().limit(limit);
-        body.read_to_vec().map_err(|e| e.to_string())
+        body.read_to_vec().map_err(explain)
+    }
+}
+
+/// Текст ошибки с тем, к чему было обращение. Имя и пароль прокси не выводятся.
+fn explain(url: &str, proxy: Option<(&str, u16)>, error: &str) -> String {
+    let host = url.split('/').nth(2).unwrap_or(url);
+    match proxy {
+        Some((name, port)) => format!("{host} (proxy {name}:{port}): {error}"),
+        None => format!("{host}: {error}"),
     }
 }
 
@@ -406,6 +418,16 @@ mod tests {
         assert!(matches!(result, Err(Failure::Replace(_))));
         assert_eq!(source.asked.borrow().len(), 1);
         assert_eq!(installed.files(), 0);
+    }
+
+    #[test]
+    fn network_errors_name_the_server_and_the_proxy() {
+        let url = "https://api.github.com/repos/x?per_page=30";
+        assert_eq!(explain(url, None, "oops"), "api.github.com: oops");
+        assert_eq!(
+            explain(url, Some(("10.0.0.1", 3128)), "oops"),
+            "api.github.com (proxy 10.0.0.1:3128): oops"
+        );
     }
 
     #[test]
