@@ -5,8 +5,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::app::App;
+use crate::app::{App, Options};
+use crate::clipboard;
 use crate::command::Mode;
+use crate::encoding::Enc;
 use crate::i18n::Lang;
 use crate::term::{EventReader, Terminal};
 use crate::{diag, ui};
@@ -19,11 +21,17 @@ pub struct Args {
     /// Start in preview mode
     #[arg(long)]
     pub view: bool,
+    /// Go to this line
+    #[arg(long, value_name = "N")]
+    pub line: Option<usize>,
+    /// File encoding (default: detect)
+    #[arg(long, value_name = "NAME")]
+    pub encoding: Option<Enc>,
     /// Interface language (default: system locale)
     #[arg(long, value_enum)]
     pub lang: Option<Lang>,
     /// Show what the terminal sends for each key and print the log on exit
-    #[arg(long, conflicts_with_all = ["file", "view"])]
+    #[arg(long, conflicts_with_all = ["file", "view", "line", "encoding"])]
     pub keys: bool,
 }
 
@@ -37,8 +45,14 @@ pub fn run() -> io::Result<()> {
         return diag::run(lang);
     }
 
-    let mode = if args.view { Mode::View } else { Mode::Edit };
-    let mut app = App::open(args.file, mode, lang)?;
+    let options = Options {
+        path: args.file,
+        mode: if args.view { Mode::View } else { Mode::Edit },
+        lang,
+        encoding: args.encoding,
+        line: args.line,
+    };
+    let mut app = App::open(options, Box::<clipboard::System>::default())?;
     let mut terminal = Terminal::enter(true)?;
     let mut reader = EventReader::new();
     while !app.should_quit {
