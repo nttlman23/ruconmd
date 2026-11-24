@@ -19,6 +19,7 @@ jobs:
             bin: ruconmd.exe
             asset: ruconmd-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
