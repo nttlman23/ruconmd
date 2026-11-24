@@ -59,6 +59,8 @@ enum Kind {
     Backspace,
     Delete,
     Paste,
+    /// Перечитывание файла.
+    Reload,
     Other,
 }
 
@@ -497,6 +499,32 @@ impl Buffer {
         step.ends = Some((previous, ends));
     }
 
+    /// Заменяет текст перечитанным. Перечитывания подряд составляют один шаг отмены:
+    /// файл, который часто меняет другая программа, не должен занимать память.
+    pub fn reload(&mut self, text: &str) {
+        if *text == self.rope {
+            return;
+        }
+        self.replace_all(text);
+        if let Some(step) = self.undo.last_mut() {
+            step.kind = Kind::Reload;
+        }
+        let pair = self.undo.len().saturating_sub(2);
+        if let [first, last] = &self.undo[pair..]
+            && first.kind == Kind::Reload
+            && last.kind == Kind::Reload
+        {
+            let last = self.undo.pop().expect("there are two steps");
+            let first = self.undo.last_mut().expect("there are two steps");
+            first.id = last.id;
+            first.edit.inserted = last.edit.inserted;
+            first.after = last.after;
+            if let (Some(a), Some(b)) = (&mut first.ends, last.ends) {
+                a.1 = b.1;
+            }
+        }
+    }
+
     fn state(&self) -> Selection {
         Selection {
             cursor: self.cursor,
@@ -658,6 +686,30 @@ mod tests {
         assert_eq!(b.text(), "один два");
         assert_eq!(b.cursor(), 8);
         assert!(!b.redo());
+    }
+
+    #[test]
+    fn reloads_in_a_row_are_one_step() {
+        let mut b = Buffer::new("a\n");
+        b.type_text("x");
+        b.mark_saved();
+        for text in ["b\r\n", "c\n", "d\r\n"] {
+            b.reload(text);
+            b.mark_saved();
+            assert!(!b.is_modified());
+        }
+        b.reload("d\r\n");
+        assert_eq!(b.undo.len(), 2);
+        assert!(b.undo() && b.is_modified());
+        assert_eq!((b.text().as_str(), b.ends.eol), ("xa\n", Eol::Lf));
+        b.redo();
+        assert_eq!((b.text().as_str(), b.ends.eol), ("d\r\n", Eol::Crlf));
+        assert!(!b.is_modified());
+        // Правка между ними начинает новый шаг.
+        b.type_text("y");
+        b.reload("e\n");
+        b.undo();
+        assert_eq!(b.text(), "dy\r\n");
     }
 
     #[test]

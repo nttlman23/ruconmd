@@ -37,6 +37,8 @@ pub enum Input {
     },
     Mouse(MouseEvent),
     Resize,
+    /// Окно терминала получило или потеряло фокус.
+    Focus(bool),
 }
 
 /// Минимальная длина потока символов, который считается вставкой.
@@ -86,6 +88,8 @@ impl InputDecoder {
                         }),
                         Event::Mouse(mouse) => out.push(Input::Mouse(*mouse)),
                         Event::Resize(..) => out.push(Input::Resize),
+                        Event::FocusGained => out.push(Input::Focus(true)),
+                        Event::FocusLost => out.push(Input::Focus(false)),
                         _ => {}
                     }
                 }
@@ -394,6 +398,14 @@ mod tests {
         assert_eq!(decode(Platform::Unix, &typed("abcdefgh")), keys("abcdefgh"));
         let event = Event::Paste("a\r\nb\rc".into());
         assert_eq!(decode(Platform::Unix, &[event]), paste("a\nb\nc", false));
+    }
+
+    #[test]
+    fn focus_is_reported() {
+        for platform in [Platform::Unix, Platform::Windows] {
+            let got = decode(platform, &[Event::FocusLost, Event::FocusGained]);
+            assert_eq!(got, [Input::Focus(false), Input::Focus(true)]);
+        }
     }
 
     #[test]

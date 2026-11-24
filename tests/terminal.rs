@@ -741,15 +741,43 @@ mod unix {
     }
 
     #[test]
+    fn file_is_reloaded_while_the_window_is_in_the_background() {
+        let home = Home::new();
+        let path = home.write("a.md", "первое\n");
+        let mut s = home.open(&[arg(&path)]);
+        s.send("\x1b[O");
+        fs::write(&path, "чужое второе\n").unwrap();
+        s.wait_for("чужое второе");
+        s.wait_for("перечитан");
+        s.send("\x1b[I");
+        s.type_text("моё ");
+        s.send("\x1b[O");
+        fs::write(&path, "чужое третье\n").unwrap();
+        s.wait_for("есть и ваши правки");
+        s.wait_for("моё чужое второе");
+        s.send(DOWN);
+        s.send(ENTER);
+        s.wait_for("чужое третье");
+        s.quit();
+        assert_eq!(home.read("a.md"), "чужое третье\n");
+    }
+
+    #[test]
     fn terminal_is_restored_on_exit() {
         let home = Home::on(Terminal::Kitty);
         let path = home.write("a.md", "текст\n");
         let mut s = home.open(&[arg(&path)]);
-        for on in ["\x1b[?1049h", "\x1b[?2004h", "\x1b[>1u"] {
+        for on in ["\x1b[?1049h", "\x1b[?2004h", "\x1b[?1004h", "\x1b[>1u"] {
             assert!(s.contains(0, on), "{on:?}");
         }
         s.quit();
-        for off in ["\x1b[?1049l", "\x1b[?2004l", "\x1b[<1u", "\x1b[?25h"] {
+        for off in [
+            "\x1b[?1049l",
+            "\x1b[?2004l",
+            "\x1b[?1004l",
+            "\x1b[<1u",
+            "\x1b[?25h",
+        ] {
             s.wait(off, |s| s.contains(0, off));
         }
         let echo = s.master.as_ref().unwrap().get_termios().unwrap();

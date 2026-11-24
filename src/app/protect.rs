@@ -161,12 +161,28 @@ impl App {
         match Disk::check(path, self.disk) {
             Change::None => {}
             Change::Touched(disk) => self.disk = Some(disk),
+            // Без фокуса и своих правок спрашивать не о чем.
+            Change::Content(_) if !self.in_focus && !self.has_own_changes() => {
+                let follow = self.follow;
+                self.message = None;
+                self.take_disk();
+                // Прокрученное не возвращается к курсору.
+                self.follow = follow;
+                if self.message.is_none() {
+                    self.message = Some(s.reloaded.into());
+                }
+            }
             Change::Content(disk) => {
                 // Если закрыть вопрос без ответа, останется своя версия.
                 self.disk = Some(disk);
                 self.disk_differs = true;
+                let title = if self.buffer.is_modified() {
+                    s.changed_on_both_sides
+                } else {
+                    s.changed_on_disk
+                };
                 self.menu(
-                    s.changed_on_disk,
+                    title,
                     vec![
                         (s.keep_mine.into(), Action::Cancel),
                         (s.reread.into(), Action::TakeDisk),
@@ -182,14 +198,32 @@ impl App {
         }
     }
 
+    /// Есть ли что терять при перечитывании. Удалённый и вновь созданный файл сам по
+    /// себе не правка: так его сохраняют некоторые программы.
+    fn has_own_changes(&self) -> bool {
+        let kept = self.disk_differs && self.disk.is_some();
+        self.buffer.is_modified() || self.format != self.saved_format || kept
+    }
+
+    /// Изменения, сделанные до возвращения фокуса, ещё считаются фоновыми.
+    pub(super) fn focus_changed(&mut self, focus: bool) {
+        self.dragging = false;
+        if focus && !self.in_focus {
+            let now = Instant::now();
+            self.next_check = now;
+            self.check_disk(now);
+        }
+        self.in_focus = focus;
+    }
+
     /// Перечитывает файл. Прежний текст можно вернуть отменой.
     pub(super) fn take_disk(&mut self) {
         let Some(path) = self.path.clone() else {
             return;
         };
-        match load(&path, None, self.lang) {
+        match load(&path, self.forced, self.lang) {
             Ok(loaded) => {
-                self.buffer.replace_all(&loaded.text);
+                self.buffer.reload(&loaded.text);
                 self.buffer.mark_saved();
                 self.accept_file(&loaded);
                 self.edited();
@@ -320,6 +354,7 @@ impl App {
             r.retarget(Some(&path));
         }
         self.path = Some(path);
+        self.forced = None;
         self.buffer = Buffer::new("");
         self.view.scroll_to_start();
         self.set_content(loaded);

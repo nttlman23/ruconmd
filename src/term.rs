@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -63,7 +63,8 @@ impl Terminal {
             execute!(stdout(), EnableMouseCapture)?;
         }
         if Platform::CURRENT == Platform::Unix {
-            execute!(stdout(), EnableBracketedPaste)?;
+            // В Windows о фокусе сообщается всегда.
+            execute!(stdout(), EnableBracketedPaste, EnableFocusChange)?;
             // С этим протоколом терминал передаёт Ctrl + кириллица.
             if supports_keyboard_enhancement().unwrap_or(false) {
                 execute!(
@@ -127,7 +128,7 @@ fn restore() {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
     if Platform::CURRENT == Platform::Unix {
-        let _ = execute!(stdout(), DisableBracketedPaste);
+        let _ = execute!(stdout(), DisableBracketedPaste, DisableFocusChange);
     }
     let _ = execute!(stdout(), DisableMouseCapture);
     let _ = execute!(

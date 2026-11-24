@@ -85,6 +85,8 @@ pub struct App {
     pub format: Format,
     /// Кодировка файла на диске.
     saved_format: Format,
+    /// Кодировка, заданная пользователем: с ней файл и перечитывается.
+    forced: Option<Enc>,
     /// Файл прочитан с потерями, запись в него требует подтверждения.
     lossy: bool,
     /// Файл, каким программа видела его последний раз. `None`: его не было.
@@ -110,6 +112,9 @@ pub struct App {
     replace_with: String,
     /// Пустое совпадение, на котором стоит курсор.
     last_empty_hit: Option<usize>,
+    /// Окно терминала в фокусе. Терминал, который о фокусе не сообщает, всегда
+    /// считается в фокусе.
+    in_focus: bool,
     /// Откуда приходили по ссылкам.
     history: Vec<Location>,
     area: TextArea,
@@ -204,6 +209,7 @@ impl App {
             should_quit: false,
             format: Format::UTF8,
             saved_format: Format::UTF8,
+            forced: options.encoding,
             lossy: false,
             disk: None,
             disk_differs: false,
@@ -224,6 +230,7 @@ impl App {
             query: Query::default(),
             replace_with: String::new(),
             last_empty_hit: None,
+            in_focus: true,
             history: Vec::new(),
             area: TextArea::default(),
             goal: None,
@@ -364,6 +371,7 @@ impl App {
             Input::Paste { text, continued } => self.pasted(&text, continued),
             Input::Mouse(mouse) => self.mouse(mouse),
             Input::Resize => {}
+            Input::Focus(focus) => self.focus_changed(focus),
         }
     }
 
@@ -874,7 +882,10 @@ impl App {
                     return;
                 };
                 match load(&path, Some(enc), self.lang) {
-                    Ok(loaded) => self.set_content(loaded),
+                    Ok(loaded) => {
+                        self.set_content(loaded);
+                        self.forced = Some(enc);
+                    }
                     Err(e) => self.message = Some(e.to_string()),
                 }
             }
@@ -974,6 +985,7 @@ impl App {
                 self.after_write(&job.path, &bytes);
                 self.format = job.format;
                 self.saved_format = job.format;
+                self.forced = self.forced.map(|_| job.format.enc);
                 self.lossy = false;
                 self.buffer.mark_saved();
                 self.proceed(job.then);
@@ -2036,6 +2048,113 @@ mod tests {
         assert_eq!(s.disk(), "моё а\n");
         let backup = s.dir.path().join("a.md.bak");
         assert_eq!(fs::read_to_string(backup).unwrap(), "чужое, длиннее\n");
+    }
+
+    fn focus(app: &mut App, focus: bool) {
+        app.handle(Input::Focus(focus));
+        draw(app);
+    }
+
+    #[test]
+    fn background_changes_are_taken_by_themselves() {
+        let lines: String = (0..100).map(|i| format!("строка {i}\n")).collect();
+        let mut s = Session::new(&lines);
+        let mut app = s.open();
+        mouse(&mut app, MouseEventKind::ScrollDown, 5, 5);
+        let top = app.view.top;
+        focus(&mut app, false);
+        for text in ["раз\n", "два, длиннее\n"] {
+            fs::write(&s.path, format!("{lines}{text}")).unwrap();
+            s.pass(&mut app, 3);
+            assert!(app.dialog.is_none() && !app.is_modified());
+            assert!(app.buffer.text().ends_with(text));
+            assert!(app.message.as_deref().unwrap().contains("reloaded"));
+        }
+        assert_eq!(app.view.top, top, "the scroll position stays");
+        // Изменение перед самым возвращением тоже фоновое.
+        fs::write(&s.path, "три\n").unwrap();
+        focus(&mut app, true);
+        assert!(app.dialog.is_none());
+        assert_eq!(app.buffer.text(), "три\n");
+        press(&mut app, "ctrl+z");
+        assert_eq!(app.buffer.text(), lines, "all reloads are one step");
+        // В фокусе по-прежнему вопрос.
+        press(&mut app, "ctrl+y");
+        fs::write(&s.path, "четыре\n").unwrap();
+        s.pass(&mut app, 3);
+        assert_eq!(menu_title(&app), Lang::En.strings().changed_on_disk);
+        assert_eq!(app.buffer.text(), "три\n");
+    }
+
+    #[test]
+    fn own_edits_are_never_replaced_in_the_background() {
+        let mut s = Session::new("а\n");
+        let mut app = s.open();
+        type_in(&mut app, "моё ");
+        focus(&mut app, false);
+        fs::write(&s.path, "чужое\n").unwrap();
+        s.pass(&mut app, 3);
+        assert_eq!(menu_title(&app), Lang::En.strings().changed_on_both_sides);
+        assert_eq!(app.buffer.text(), "моё а\n");
+        // Оставили свою версию: и следующее чужое изменение не берётся само.
+        press(&mut app, "enter");
+        press(&mut app, "ctrl+z");
+        assert!(!app.buffer.is_modified());
+        fs::write(&s.path, "чужое, длиннее\n").unwrap();
+        s.pass(&mut app, 3);
+        assert!(app.dialog.is_some());
+        press(&mut app, "down enter");
+        assert_eq!(app.buffer.text(), "чужое, длиннее\n");
+        // Выбранная, но не записанная кодировка тоже правка.
+        app.act(Action::SetFormat(Format::of(Enc::Cp1251)));
+        fs::write(&s.path, "ещё\n").unwrap();
+        s.pass(&mut app, 3);
+        assert!(app.dialog.is_some());
+    }
+
+    #[test]
+    fn file_replaced_through_deletion_is_taken_too() {
+        let mut s = Session::new("а\n");
+        let mut app = s.open();
+        focus(&mut app, false);
+        fs::remove_file(&s.path).unwrap();
+        s.pass(&mut app, 3);
+        assert!(app.is_modified() && app.buffer.text() == "а\n");
+        fs::write(&s.path, "новое\n").unwrap();
+        s.pass(&mut app, 3);
+        assert!(app.dialog.is_none() && !app.is_modified());
+        assert_eq!(app.buffer.text(), "новое\n");
+    }
+
+    #[test]
+    fn chosen_encoding_is_used_for_rereading() {
+        let mut s = Session::new("а\n");
+        let mut app = s.open();
+        let koi = |text| encoding::encode(text, Format::of(Enc::Koi8R)).unwrap();
+        fs::write(&s.path, koi("ПРИВЕТ\n")).unwrap();
+        app.act(Action::Reload(Enc::Koi8R));
+        focus(&mut app, false);
+        // Определение выбрало бы другую кодировку.
+        fs::write(&s.path, koi("аб\n")).unwrap();
+        assert_ne!(encoding::decode(&koi("аб\n"), None).text, "аб\n");
+        s.pass(&mut app, 3);
+        assert_eq!(app.buffer.text(), "аб\n");
+    }
+
+    #[test]
+    fn preview_follows_background_changes() {
+        let mut s = Session::new("# Раз\n");
+        let mut app = s.open();
+        press(&mut app, "f5");
+        focus(&mut app, false);
+        fs::write(&s.path, "# Другое\n").unwrap();
+        s.pass(&mut app, 3);
+        let shown: String = app.pane.visible()[0]
+            .spans
+            .iter()
+            .map(|s| &*s.text)
+            .collect();
+        assert_eq!(shown, "Другое");
     }
 
     #[test]
