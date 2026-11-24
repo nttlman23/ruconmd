@@ -689,6 +689,7 @@ mod tests {
     #[test]
     fn paste_replaces_selection_and_continues_as_one_step() {
         let mut b = Buffer::new("abc");
+        b.ends.eol = Eol::Lf;
         b.move_to(1, false);
         b.move_to(2, true);
         b.paste("X\r\nY", false);

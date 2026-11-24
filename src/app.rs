@@ -939,6 +939,10 @@ mod tests {
     fn with_text(text: &str) -> App {
         let mut app = open(None, None);
         app.buffer = Buffer::new(text);
+        // В Windows у текста без переводов строк был бы CRLF.
+        if !text.contains('\n') {
+            app.buffer.ends.eol = Eol::Lf;
+        }
         draw(&mut app);
         app
     }
