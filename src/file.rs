@@ -81,22 +81,41 @@ pub fn write_exact(
     if path.is_dir() {
         return Err(io::Error::other("is a directory"));
     }
-    let (mut file, temp) = create_temp(path, true)?;
+    let (file, temp) = create_temp(path, true)?;
+    fill(file, &temp, path, bytes, |file| match like {
+        Some((source, meta)) => copy_rights(source, file, meta),
+        None => Ok(()),
+    })
+}
+
+/// Записывает файл, доступный только владельцу, через временный `temp`.
+pub fn write_private(path: &Path, temp: &Path, bytes: &[u8]) -> io::Result<()> {
+    match fs::remove_file(temp) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let file = new_file(temp, true)?;
+    fill(file, temp, path, bytes, |_| Ok(()))
+}
+
+/// Готовит временный файл, записывает его и ставит на место `path`.
+fn fill(
+    mut file: File,
+    temp: &Path,
+    path: &Path,
+    bytes: &[u8],
+    prepare: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
     let result = (|| {
-        // Владельца может не выйти сменить, для копии достаточно прав. Без списка
-        // доступа они значили бы другое, тогда копия видна только владельцу.
-        if let Some((source, meta)) = like
-            && (cfg!(not(unix)) || xattr::copy(source, &file).is_ok())
-        {
-            file.set_permissions(meta.permissions())?;
-        }
+        // До записи: чужим содержимое не видно ни на миг.
+        prepare(&file)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temp, path)
+        fs::rename(temp, path)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temp);
+        let _ = fs::remove_file(temp);
     }
     result
 }
@@ -191,26 +210,16 @@ fn can_replace(_: &fs::Metadata) -> bool {
 }
 
 fn replace(target: &Path, bytes: &[u8], old: Option<&fs::Metadata>) -> io::Result<()> {
-    let (mut file, temp) = create_temp(target, old.is_some())?;
-    let result = (|| {
-        // Права ставятся до записи: чужим содержимое не видно ни на миг.
-        if let Some(old) = old {
-            copy_attributes(target, &file, old)?;
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temp, target)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-        return result;
-    }
+    let (file, temp) = create_temp(target, old.is_some())?;
+    fill(file, &temp, target, bytes, |file| match old {
+        Some(old) => copy_attributes(target, file, old),
+        None => Ok(()),
+    })?;
     #[cfg(unix)]
     if let Ok(dir) = File::open(parent(target)) {
         let _ = dir.sync_all();
     }
-    result
+    Ok(())
 }
 
 fn create_temp(target: &Path, private: bool) -> io::Result<(File, PathBuf)> {
@@ -224,21 +233,49 @@ fn create_temp(target: &Path, private: bool) -> io::Result<(File, PathBuf)> {
         // Имя не зависит от исходного: вместе они могли бы превысить предел длины.
         let name = format!(".ruconmd-{}-{nanos}-{attempt}.tmp", std::process::id());
         let temp = target.with_file_name(name);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        if private {
-            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        }
-        #[cfg(not(unix))]
-        let _ = private;
-        match options.open(&temp) {
+        match new_file(&temp, private) {
             Ok(file) => return Ok((file, temp)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
     }
     Err(io::Error::other("cannot create a temporary file"))
+}
+
+fn new_file(path: &Path, private: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    options.open(path)
+}
+
+/// Права резервной копии. Владельца может не выйти сменить, для копии это не
+/// беда. Но без группы и списка доступа те же биты открыли бы её другим людям,
+/// тогда она остаётся доступной только владельцу.
+#[cfg(unix)]
+fn copy_rights(source: &Path, file: &File, meta: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, fchown};
+    let (uid, gid) = (Some(meta.uid()), Some(meta.gid()));
+    let new = file.metadata()?;
+    let owned = (new.uid(), new.gid()) == (meta.uid(), meta.gid())
+        || fchown(file, uid, gid).is_ok()
+        || new.gid() == meta.gid()
+        || fchown(file, None, gid).is_ok();
+    if !owned || xattr::copy(source, file).is_err() {
+        return Ok(());
+    }
+    // Копию не запускают, особые биты ей не нужны.
+    file.set_permissions(fs::Permissions::from_mode(meta.mode() & 0o777))
+}
+
+#[cfg(not(unix))]
+fn copy_rights(_: &Path, file: &File, meta: &fs::Metadata) -> io::Result<()> {
+    file.set_permissions(meta.permissions())
 }
 
 #[cfg(unix)]
@@ -321,7 +358,7 @@ mod xattr {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 mod xattr {
     pub fn copy(_: &std::path::Path, _: &std::fs::File) -> std::io::Result<()> {
         Ok(())
@@ -431,6 +468,40 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
             write(&path, b"new").unwrap();
             assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
+        }
+
+        #[test]
+        fn copy_keeps_the_group_and_its_rights() {
+            let dir = dir();
+            let (path, copy) = (dir.path().join("a.md"), dir.path().join("a.md.bak"));
+            fs::write(&path, "text").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            let groups = std::process::Command::new("id").arg("-G").output().unwrap();
+            let groups = String::from_utf8(groups.stdout).unwrap();
+            for gid in groups.split_whitespace().map(|g| g.parse().unwrap()) {
+                std::os::unix::fs::chown(&path, None, Some(gid)).unwrap();
+                let meta = fs::metadata(&path).unwrap();
+                write_exact(&copy, b"text", Some((&path, &meta))).unwrap();
+                let made = fs::metadata(&copy).unwrap();
+                assert_eq!((made.gid(), made.mode() & 0o7777), (gid, 0o640));
+            }
+        }
+
+        #[test]
+        fn copy_is_private_when_the_group_cannot_be_kept() {
+            let dir = dir();
+            let copy = dir.path().join("copy");
+            // Чужой файл с доступом для группы и остальных.
+            let source = Path::new("/etc/passwd");
+            let meta = fs::metadata(source).unwrap();
+            assert_ne!(meta.mode() & 0o044, 0);
+            write_exact(&copy, b"text", Some((source, &meta))).unwrap();
+            let made = fs::metadata(&copy).unwrap();
+            // Суперпользователь и член группы могут её повторить.
+            if made.gid() != meta.gid() {
+                assert_eq!(made.mode() & 0o7777, 0o600);
+            }
+            assert_eq!(fs::read(&copy).unwrap(), b"text");
         }
 
         /// Список доступа: владелец и пользователь 12345 читают и пишут, группа нет.

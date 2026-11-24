@@ -18,6 +18,10 @@ use crate::file;
 /// Наибольшая потеря правок при сбое.
 pub const INTERVAL: Duration = Duration::from_secs(5);
 
+/// Файлы моложе этого при уборке не трогаются: их сеанс мог ещё не успеть
+/// поставить блокировку.
+const FRESH: Duration = Duration::from_secs(60 * 60);
+
 const MAGIC: &str = "ruconmd-recovery 1";
 
 /// Отпечаток FNV-1a: одинаков во всех версиях программы.
@@ -81,6 +85,7 @@ pub struct Orphan {
 impl Orphan {
     pub fn remove(&self) {
         let _ = fs::remove_file(&self.file);
+        let _ = fs::remove_file(self.file.with_extension("tmp"));
         let _ = fs::remove_file(self.file.with_extension("lock"));
     }
 }
@@ -134,6 +139,53 @@ fn is_locked(path: &Path) -> bool {
         Ok(file) => matches!(file.try_lock(), Err(TryLockError::WouldBlock)),
         Err(_) => false,
     }
+}
+
+/// Убирает то, что осталось от сеансов, прерванных во время записи копии:
+/// недописанные файлы и блокировки без копий. Готовые копии не трогает.
+pub fn clean(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let (file, name) = (entry.path(), entry.file_name());
+        let Some(name) = name.to_str() else { continue };
+        let modified = entry.metadata().and_then(|m| m.modified());
+        let age = modified.map(|m| SystemTime::now().duration_since(m));
+        if !matches!(age, Ok(Ok(age)) if age >= FRESH) {
+            continue;
+        }
+        // Так временные файлы назывались в 0.1.0-beta.2 и раньше.
+        if name.starts_with(".ruconmd-") && name.ends_with(".tmp") {
+            let _ = fs::remove_file(&file);
+        } else if is_session_file(name, "lock") {
+            if !is_abandoned(&file) {
+                continue;
+            }
+            let _ = fs::remove_file(file.with_extension("tmp"));
+            if !file.with_extension("rec").exists() {
+                let _ = fs::remove_file(&file);
+            }
+        } else if is_session_file(name, "tmp") && !file.with_extension("lock").exists() {
+            let _ = fs::remove_file(&file);
+        }
+    }
+}
+
+/// Имя вида `отпечаток-процесс-время.расширение`.
+fn is_session_file(name: &str, extension: &str) -> bool {
+    let Some((stem, found)) = name.split_once('.') else {
+        return false;
+    };
+    let parts: Vec<&str> = stem.split('-').collect();
+    let hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
+    found == extension && parts.len() == 3 && parts[0].len() == 16 && parts.into_iter().all(hex)
+}
+
+/// Блокировку никто не держит. Если узнать нельзя, считается, что держат.
+fn is_abandoned(lock: &Path) -> bool {
+    let file = OpenOptions::new().read(true).write(true).open(lock);
+    file.is_ok_and(|f| f.try_lock().is_ok())
 }
 
 /// Копия текущего сеанса.
@@ -215,7 +267,8 @@ impl Recovery {
         self.written = Some(revision);
         self.pending = None;
         self.job = Some(std::thread::spawn(move || {
-            file::write_exact(&file, encode(meta, &rope.to_string()).as_bytes(), None)
+            let temp = file.with_extension("tmp");
+            file::write_private(&file, &temp, encode(meta, &rope.to_string()).as_bytes())
         }));
         Ok(())
     }
@@ -356,6 +409,91 @@ mod tests {
         crash(new);
         crash(bad);
         assert_eq!(search(dir.path(), None).orphan.unwrap().text, "новое");
+    }
+
+    /// Делает файл давним.
+    fn age(path: &Path) {
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(SystemTime::now() - FRESH * 2).unwrap();
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let entries = fs::read_dir(dir).unwrap().flatten();
+        let mut names: Vec<_> = entries
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn leftovers_of_interrupted_writing_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name);
+        let mut kept = Vec::new();
+        let mut add = |name: &str, old: bool, keep: bool| {
+            fs::write(path(name), "тайна").unwrap();
+            if old {
+                age(&path(name));
+            }
+            if keep {
+                kept.push(name.to_owned());
+            }
+        };
+        // Прерван на первой копии.
+        add("00000000000000aa-1-a.lock", true, false);
+        add("00000000000000aa-1-a.tmp", true, false);
+        // Прерван на следующей: готовая копия остаётся.
+        add("00000000000000aa-2-a.lock", true, true);
+        add("00000000000000aa-2-a.rec", true, true);
+        add("00000000000000aa-2-a.tmp", true, false);
+        // Блокировки уже нет.
+        add("00000000000000aa-3-a.tmp", true, false);
+        add("00000000000000aa-4-a.rec", true, true);
+        add(".ruconmd-5-5-0.tmp", true, false);
+        // Слишком свежие.
+        add("00000000000000aa-6-a.lock", false, true);
+        add("00000000000000aa-6-a.tmp", false, true);
+        add(".ruconmd-7-7-0.tmp", false, true);
+        // Не наши.
+        add("notes.tmp", true, true);
+        add("notes.lock", true, true);
+        add("00000000000000aa-8.tmp", true, true);
+        clean(dir.path());
+        kept.sort();
+        assert_eq!(names(dir.path()), kept);
+        clean(&path("none"));
+    }
+
+    #[test]
+    fn files_of_a_live_session_are_not_cleaned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Recovery::new(dir.path().into(), None);
+        r.prepare().unwrap();
+        let temp = r.file.with_extension("tmp");
+        fs::write(&temp, "пишется").unwrap();
+        age(&temp);
+        let old = SystemTime::now() - FRESH * 2;
+        r.lock.as_ref().unwrap().set_modified(old).unwrap();
+        clean(dir.path());
+        assert_eq!(names(dir.path()).len(), 2);
+        r.lock = None;
+        clean(dir.path());
+        assert!(names(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn unfinished_copy_is_replaced_and_dropped_with_its_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Recovery::new(dir.path().into(), None);
+        let temp = r.file.with_extension("tmp");
+        fs::write(&temp, "остаток").unwrap();
+        r.write_now(1, META, rope("текст")).unwrap();
+        assert!(!temp.exists());
+        fs::write(&temp, "остаток").unwrap();
+        crash(r);
+        search(dir.path(), None).orphan.unwrap().remove();
+        assert!(names(dir.path()).is_empty());
     }
 
     #[test]

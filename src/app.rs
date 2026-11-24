@@ -27,7 +27,7 @@ use crate::keymap::Keymap;
 use crate::links::Opener;
 use crate::mdline::States;
 use crate::pane::{Pane, Shown};
-use crate::recovery::{Orphan, Recovery};
+use crate::recovery::{self, Orphan, Recovery};
 use crate::search::{Query, Search};
 use crate::style::Theme;
 use crate::view::{Place, Viewport};
@@ -225,6 +225,9 @@ impl App {
             app.message = Some(lang.config_warning(first, more));
         }
         app.offer_recovery();
+        if let Some(dir) = &app.state_dir {
+            recovery::clean(dir);
+        }
         Ok(app)
     }
 
