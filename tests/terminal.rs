@@ -24,9 +24,11 @@ const ENTER: &str = "\r";
 const ESC: &str = "\x1b";
 const TAB: &str = "\t";
 const F1: &str = "\x1bOP";
+const F4: &str = "\x1bOS";
 const F5: &str = "\x1b[15~";
 const F9: &str = "\x1b[20~";
 const DOWN: &str = "\x1b[B";
+const RIGHT: &str = "\x1b[C";
 const CTRL_A: &str = "\x01";
 const CTRL_C: &str = "\x03";
 const CTRL_E: &str = "\x05";
@@ -544,6 +546,67 @@ fn killed_session_is_restored() {
     s.wait_file(&path, "правка старое\n");
     s.quit();
     assert_eq!(home.copies(), 0);
+}
+
+#[test]
+fn directory_is_opened_and_a_file_is_chosen() {
+    let home = Home::new();
+    let dir = home.path("docs");
+    fs::create_dir_all(dir.join("глубже")).unwrap();
+    fs::write(dir.join("a.md"), "первый\n").unwrap();
+    fs::write(dir.join("глубже").join("b.md"), "второй\n").unwrap();
+    let mut s = home.start(&[arg(&dir)]);
+    s.wait_for("ФАЙЛЫ");
+    s.wait_for("глубже");
+    s.send(ENTER);
+    s.wait_for("b.md");
+    s.send(DOWN);
+    s.send(ENTER);
+    s.wait_for("второй");
+    s.type_text("ещё ");
+    s.wait_for("ещё второй");
+    // Другой файл: сначала вопрос о правках.
+    s.send(F4);
+    s.wait_for("ФАЙЛЫ");
+    s.send(DOWN);
+    s.send(ENTER);
+    s.wait_for("Есть несохранённые правки");
+    s.send(ENTER);
+    s.wait_for("первый");
+    assert_eq!(
+        fs::read_to_string(dir.join("глубже").join("b.md")).unwrap(),
+        "ещё второй\n"
+    );
+    s.send(F4);
+    s.send(F4);
+    s.wait_gone("глубже");
+    s.quit();
+}
+
+#[test]
+fn settings_are_changed_in_the_program() {
+    let home = Home::new();
+    home.config("# моё\n[editor]\nline_numbers = true # номера\n");
+    let path = home.write("a.md", "строка\n");
+    let mut s = home.open(&[arg(&path)]);
+    s.wait_for("1 строка");
+    s.send(F9);
+    s.wait_for("Номера строк");
+    for _ in 0..4 {
+        s.send(DOWN);
+    }
+    s.send(RIGHT);
+    s.send(ENTER);
+    s.wait_for("Настройки сохранены");
+    s.wait_gone("1 строка");
+    assert_eq!(
+        home.read("config/ruconmd/config.toml"),
+        "# моё\n[editor]\nline_numbers = false # номера\n"
+    );
+    s.quit();
+    let mut s = home.open(&[arg(&path)]);
+    assert!(!s.screen().contains("1 строка"));
+    s.quit();
 }
 
 #[test]

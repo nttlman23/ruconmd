@@ -1,8 +1,10 @@
 //! Состояние программы и реакция на ввод. Отрисовки и терминала здесь нет.
 
+pub mod browse;
 mod find;
 mod markup;
 mod navigate;
+mod preferences;
 mod protect;
 
 use std::collections::HashSet;
@@ -12,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
+use crate::app::browse::Browser;
 use crate::buffer::{Buffer, Eol};
 use crate::clipboard::Clipboard;
 use crate::command::{Command, Mode};
@@ -29,6 +32,7 @@ use crate::mdline::States;
 use crate::pane::{Pane, Shown};
 use crate::recovery::{self, Orphan, Recovery};
 use crate::search::{Query, Search};
+use crate::settings::Values;
 use crate::style::Theme;
 use crate::view::{Place, Viewport};
 
@@ -47,12 +51,16 @@ pub struct TextArea {
 
 pub struct Options {
     pub path: Option<PathBuf>,
+    /// Каталог для панели файлов.
+    pub dir: Option<PathBuf>,
     pub mode: Mode,
     pub lang: Lang,
     pub encoding: Option<Enc>,
     /// Номер строки с единицы.
     pub line: Option<usize>,
     pub config: Config,
+    /// Куда записывать настройки.
+    pub config_path: Option<PathBuf>,
     pub warnings: Vec<Warning>,
     /// Где хранить копии для восстановления. `None`: не хранить.
     pub state_dir: Option<PathBuf>,
@@ -110,6 +118,15 @@ pub struct App {
     /// Показать курсор при следующей отрисовке.
     follow: bool,
     dragging: bool,
+    /// Настройки, которые меняются в диалоге.
+    pub values: Values,
+    themes: Vec<(String, Theme)>,
+    pub config_path: Option<PathBuf>,
+    pub browser: Option<Browser>,
+    /// Колонка экрана, с которой начинается просмотр.
+    origin: u16,
+    /// Текст закрыт панелью.
+    covered: bool,
 }
 
 struct Loaded {
@@ -165,6 +182,7 @@ impl App {
             },
         };
         let config = options.config;
+        let values = Values::of(&config);
         let path = options.path;
         let state_dir = options.state_dir;
         let recovery = state_dir
@@ -211,6 +229,12 @@ impl App {
             goal: None,
             follow: true,
             dragging: false,
+            values,
+            themes: config.themes,
+            config_path: options.config_path,
+            browser: None,
+            origin: 0,
+            covered: false,
         };
         app.pane.reset(app.path.clone());
         app.set_content(loaded);
@@ -223,6 +247,9 @@ impl App {
         if let Some(first) = options.warnings.first() {
             let more = options.warnings.len() - 1;
             app.message = Some(lang.config_warning(first, more));
+        }
+        if let Some(dir) = &options.dir {
+            app.browse(dir);
         }
         app.offer_recovery();
         if let Some(dir) = &app.state_dir {
@@ -309,13 +336,19 @@ impl App {
 
     /// Картинки, которые будут на экране. Под окнами они не рисуются.
     pub fn images_on_screen(&self) -> Vec<Shown> {
-        let covered = self.help || matches!(self.dialog, Some(Dialog::Menu(_)));
+        let window = matches!(self.dialog, Some(Dialog::Menu(_) | Dialog::Settings(_)));
+        let covered = self.help || window || self.covered;
         if self.mode != Mode::View || covered || self.pane.graphics().is_none() {
             return Vec::new();
         }
         let mut shown = self.pane.shown_images();
         shown.retain(|s| self.pane.picture(s.image).is_some());
         shown
+    }
+
+    /// Колонка экрана, с которой начинается просмотр.
+    pub fn origin(&self) -> u16 {
+        self.origin
     }
 
     /// Нужна отрисовка, даже если пользователь ничего не нажимает.
@@ -336,9 +369,11 @@ impl App {
 
     fn pasted(&mut self, text: &str, continued: bool) {
         self.help = false;
+        let in_files = self.files_focused();
         match &mut self.dialog {
             Some(Dialog::Field(field)) => field.insert(text),
-            Some(Dialog::Menu(_) | Dialog::Replace(_)) => {}
+            Some(Dialog::Menu(_) | Dialog::Replace(_) | Dialog::Settings(_)) => {}
+            None if in_files => {}
             None if self.mode == Mode::Edit => {
                 self.message = None;
                 self.buffer.paste(text, continued);
@@ -353,6 +388,9 @@ impl App {
         if let Some(Dialog::Replace(_)) = &self.dialog {
             return self.replace_key(chord);
         }
+        if let Some(Dialog::Settings(_)) = &self.dialog {
+            return self.settings_key(chord);
+        }
         if self.find_option(chord) {
             return;
         }
@@ -364,6 +402,9 @@ impl App {
         if self.help && command != Some(Command::Quit) {
             self.help = false;
             return;
+        }
+        if self.files_focused() {
+            return self.files_key(chord, command);
         }
         match (command, self.mode) {
             (Some(command), _) => self.run(command),
@@ -465,14 +506,18 @@ impl App {
 
     fn mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.wheel(-WHEEL_LINES),
-            MouseEventKind::ScrollDown => self.wheel(WHEEL_LINES),
+            MouseEventKind::ScrollUp => self.wheel(mouse, -WHEEL_LINES),
+            MouseEventKind::ScrollDown => self.wheel(mouse, WHEEL_LINES),
+            MouseEventKind::Down(MouseButton::Left) if self.press_files(mouse) => {}
             MouseEventKind::Down(MouseButton::Left) if self.mode == Mode::View => {
                 let y = mouse.row.checked_sub(self.area.y);
                 if let Some(y) = y.filter(|y| *y < self.area.height)
                     && self.dialog.is_none()
                     && !self.help
-                    && self.pane.select_at(mouse.column as usize, y as usize)
+                    && self.pane.select_at(
+                        mouse.column.saturating_sub(self.origin) as usize,
+                        y as usize,
+                    )
                 {
                     self.message = None;
                     self.activate(false);
@@ -502,8 +547,20 @@ impl App {
         self.view.hit(&self.buffer, x, y)
     }
 
-    fn wheel(&mut self, delta: isize) {
+    /// Нажатие в панели файлов. Нажатие в тексте возвращает к нему.
+    fn press_files(&mut self, mouse: MouseEvent) -> bool {
         if self.dialog.is_some() || self.help {
+            return false;
+        }
+        if self.files_click(mouse.column, mouse.row) {
+            return true;
+        }
+        self.leave_files();
+        false
+    }
+
+    fn wheel(&mut self, mouse: MouseEvent, delta: isize) {
+        if self.dialog.is_some() || self.help || self.files_wheel(mouse.column, mouse.row, delta) {
             return;
         }
         match self.mode {
@@ -593,6 +650,8 @@ impl App {
             Command::Help => self.help = true,
             Command::Quit if self.is_modified() => self.ask_unsaved(Then::Quit),
             Command::Quit => self.should_quit = true,
+            Command::Files => self.toggle_files(),
+            Command::Settings => self.ask_settings(),
             Command::Save => self.save(Then::Stay),
             Command::SaveAs => self.ask_path(Then::Stay),
             Command::Undo => {
@@ -721,7 +780,12 @@ impl App {
 
     fn ask_path(&mut self, then: Then) {
         let path = self.path.as_ref();
-        let text = path.map_or(String::new(), |p| p.display().to_string());
+        let text = match (path, self.new_file_dir()) {
+            (Some(path), _) => path.display().to_string(),
+            // Новый файл создаётся в показанном каталоге.
+            (None, Some(dir)) => format!("{}", dir.join("").display()),
+            (None, None) => String::new(),
+        };
         let title = self.lang.strings().ask_path;
         let field = Field::new(Ask::SavePath(then), title, text);
         self.dialog = Some(Dialog::Field(field));
@@ -776,6 +840,9 @@ impl App {
                 Err(_) => self.message = Some(self.lang.strings().bad_number.into()),
             },
             Ask::SavePath(_) if trimmed.is_empty() => {}
+            Ask::SavePath(_) if Path::new(trimmed).is_dir() => {
+                self.message = Some(format!("{trimmed}: {}", self.lang.strings().is_directory));
+            }
             Ask::SavePath(then) => self.write(SaveJob {
                 path: PathBuf::from(trimmed),
                 format: self.format,
@@ -942,11 +1009,13 @@ mod tests {
     fn open(path: Option<PathBuf>, encoding: Option<Enc>) -> App {
         let options = Options {
             path,
+            dir: None,
             mode: Mode::Edit,
             lang: Lang::En,
             encoding,
             line: None,
             config: Config::default(),
+            config_path: None,
             warnings: Vec::new(),
             state_dir: None,
         };
@@ -1801,11 +1870,13 @@ mod tests {
         fn open(&self) -> App {
             let options = Options {
                 path: Some(self.path.clone()),
+                dir: None,
                 mode: Mode::Edit,
                 lang: Lang::En,
                 encoding: None,
                 line: None,
                 config: self.config.clone(),
+                config_path: None,
                 warnings: Vec::new(),
                 state_dir: Some(self.state()),
             };
@@ -2015,6 +2086,233 @@ mod tests {
         }
     }
 
+    /// Каталог с документами, открытый в панели.
+    fn in_directory(dir: &Path) -> App {
+        fs::create_dir(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.md"), "первый\n").unwrap();
+        fs::write(dir.join("b.md"), "второй\n").unwrap();
+        fs::write(dir.join("sub").join("c.md"), "третий\n").unwrap();
+        let options = Options {
+            path: None,
+            dir: Some(dir.to_owned()),
+            mode: Mode::Edit,
+            lang: Lang::En,
+            encoding: None,
+            line: None,
+            config: Config::default(),
+            config_path: Some(dir.join("cfg").join("config.toml")),
+            warnings: Vec::new(),
+            state_dir: None,
+        };
+        let mut app =
+            App::open(options, Box::<Local>::default(), Box::<Opened>::default()).unwrap();
+        app.prepare_files(Some(PANEL), PANEL.width, false);
+        draw(&mut app);
+        app
+    }
+
+    const PANEL: TextArea = TextArea {
+        x: 0,
+        y: 1,
+        width: 4,
+        height: 10,
+    };
+
+    fn chosen(app: &App) -> String {
+        let tree = &app.browser.as_ref().unwrap().tree;
+        tree.selected().unwrap().name.clone()
+    }
+
+    #[test]
+    fn file_is_chosen_in_the_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = in_directory(dir.path());
+        assert!(app.files_focused() && !app.is_modified());
+        assert_eq!(chosen(&app), "sub");
+        // Печать в панели ищет имя, а не правит текст.
+        type_in(&mut app, "b");
+        assert_eq!(chosen(&app), "b.md");
+        press(&mut app, "ctrl+x ctrl+v ctrl+b ctrl+z ctrl+r");
+        app.handle(Input::Paste {
+            text: "x".into(),
+            continued: false,
+        });
+        assert!(!app.is_modified() && app.dialog.is_none());
+        press(&mut app, "enter");
+        assert!(!app.files_focused());
+        assert_eq!(app.buffer.text(), "второй\n");
+        assert_eq!(app.path, Some(dir.path().join("b.md")));
+        // Обратно в панель: выбран открытый файл.
+        press(&mut app, "f4");
+        assert!(app.files_focused());
+        press(&mut app, "home down right right enter");
+        assert_eq!(app.buffer.text(), "третий\n");
+        // Тот же файл открывать незачем, курсор на месте.
+        press(&mut app, "end ctrl+o enter");
+        assert!(!app.files_focused());
+        assert_eq!(app.cursor_line_column(), (1, 7));
+        press(&mut app, "f4 f4");
+        assert!(!app.files_focused() && !app.browser.as_ref().unwrap().shown);
+    }
+
+    #[test]
+    fn panel_asks_about_unsaved_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = in_directory(dir.path());
+        type_in(&mut app, "a");
+        press(&mut app, "enter");
+        type_in(&mut app, "x");
+        press(&mut app, "f4 down enter");
+        assert_eq!(menu_title(&app), Lang::En.strings().ask_quit);
+        press(&mut app, "esc");
+        assert_eq!(app.buffer.text(), "xпервый\n");
+        press(&mut app, "enter enter");
+        assert_eq!(app.buffer.text(), "второй\n");
+        let saved = fs::read_to_string(dir.path().join("a.md")).unwrap();
+        assert_eq!(saved, "xпервый\n");
+    }
+
+    #[test]
+    fn panel_starts_in_the_directory_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "").unwrap();
+        fs::write(dir.path().join("b.md"), "").unwrap();
+        let mut app = open(Some(dir.path().join("b.md")), None);
+        assert!(app.browser.is_none());
+        press(&mut app, "ctrl+o");
+        assert_eq!(app.browser.as_ref().unwrap().tree.root(), dir.path());
+        assert_eq!(chosen(&app), "b.md");
+        press(&mut app, "esc");
+        type_in(&mut app, "y");
+        assert_eq!(app.buffer.text(), "y");
+        // Команды текста из панели сначала возвращают к нему.
+        press(&mut app, "ctrl+o ctrl+f");
+        assert!(!app.files_focused() && matches!(app.dialog, Some(Dialog::Field(_))));
+    }
+
+    #[test]
+    fn new_file_is_saved_in_the_shown_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = in_directory(dir.path());
+        press(&mut app, "esc");
+        type_in(&mut app, "новый");
+        press(&mut app, "ctrl+s enter");
+        assert!(app.message.as_deref().unwrap().contains("is a directory"));
+        press(&mut app, "ctrl+s");
+        type_in(&mut app, "n.md");
+        press(&mut app, "enter");
+        let saved = fs::read_to_string(dir.path().join("n.md")).unwrap();
+        assert_eq!(saved, "новый");
+    }
+
+    #[test]
+    fn mouse_works_in_the_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = in_directory(dir.path());
+        press(&mut app, "esc");
+        // Строки: корень, `..`, sub, a.md, b.md.
+        mouse(&mut app, DOWN, 1, 4);
+        assert_eq!(app.buffer.text(), "первый\n");
+        assert!(!app.files_focused());
+        mouse(&mut app, DOWN, 1, 3);
+        assert!(app.files_focused());
+        mouse(&mut app, MouseEventKind::ScrollDown, 1, 4);
+        assert_eq!(app.buffer.cursor(), 0);
+        mouse(&mut app, DOWN, 6, 1);
+        assert!(!app.files_focused());
+        assert_eq!(app.cursor_line_column(), (1, 3));
+        // Протягивание из текста панель не задевает.
+        mouse(&mut app, DRAG, 1, 4);
+        assert!(!app.files_focused());
+    }
+
+    #[test]
+    fn preview_clicks_count_from_the_panel() {
+        let mut app = with_text("- [ ] дело\n");
+        press(&mut app, "f5");
+        app.prepare_files(None, 20, false);
+        mouse(&mut app, DOWN, 1, 1);
+        assert!(!app.is_modified());
+        mouse(&mut app, DOWN, 21, 1);
+        assert_eq!(app.buffer.text(), "- [x] дело\n");
+    }
+
+    #[test]
+    fn settings_apply_at_once_and_can_be_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = in_directory(dir.path());
+        press(&mut app, "esc f9 right");
+        assert_eq!(app.lang, Lang::Ru);
+        press(&mut app, "down right down right down space down left");
+        assert_eq!(app.theme, Theme::LIGHT);
+        assert_eq!(app.view.settings.tab_width, 5);
+        assert!(!app.view.settings.wrap && !app.view.settings.line_numbers);
+        press(&mut app, "esc");
+        assert_eq!(app.theme, Theme::DARK);
+        assert_eq!(app.view.settings, crate::view::Settings::default());
+        assert!(!dir.path().join("cfg").exists());
+        assert!(!app.is_modified());
+    }
+
+    #[test]
+    fn settings_are_saved_to_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = in_directory(dir.path());
+        let path = dir.path().join("cfg").join("config.toml");
+        press(&mut app, "f9 down right enter");
+        assert!(app.dialog.is_none());
+        assert!(app.message.as_deref().unwrap().contains("config.toml"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().trim(),
+            "theme = \"light\""
+        );
+        press(&mut app, "f9 enter");
+        assert!(app.message.is_none(), "nothing to save");
+        // Испорченный файл не переписывается.
+        fs::write(&path, "[oops").unwrap();
+        press(&mut app, "f9 down right enter");
+        assert!(app.message.as_deref().unwrap().contains("by hand"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[oops");
+        assert_eq!(app.theme, Theme::DARK, "works until the end of the session");
+    }
+
+    #[test]
+    fn settings_file_is_created_and_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = in_directory(dir.path());
+        press(&mut app, "f9 end enter");
+        assert!(app.path.as_ref().unwrap().ends_with("config.toml"));
+        assert!(app.buffer.text().contains("[keys]"));
+        assert!(!app.files_focused() && !app.is_modified());
+    }
+
+    #[test]
+    fn autosave_and_panel_settings_work_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = in_directory(dir.path());
+        fs::write(dir.path().join("x.png"), "").unwrap();
+        press(&mut app, "f9 end up up right");
+        let tree = &app.browser.as_ref().unwrap().tree;
+        assert!(tree.visible().any(|(row, _)| row.name == "x.png"));
+        press(&mut app, "up up right");
+        assert_eq!(app.autosave, Some(Duration::from_secs(5)));
+        press(&mut app, "down right");
+        assert_eq!(app.autosave, Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn narrow_screens_give_the_panel_everything_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = in_directory(dir.path());
+        use browse::PanelPlace::*;
+        assert_eq!(app.panel_place(100), Side(30));
+        assert_eq!(app.panel_place(60), Side(30));
+        assert_eq!(app.panel_place(59), Full);
+        press(&mut app, "esc");
+        assert_eq!(app.panel_place(59), Hidden);
+        assert_eq!(app.panel_place(100), Side(30));
+    }
+
     #[test]
     fn own_saves_touching_and_deleting() {
         let mut s = Session::new("а\n");
@@ -2134,11 +2432,13 @@ mod tests {
         let start = || {
             let options = Options {
                 path: None,
+                dir: None,
                 mode: Mode::Edit,
                 lang: Lang::En,
                 encoding: None,
                 line: None,
                 config: Config::default(),
+                config_path: None,
                 warnings: Vec::new(),
                 state_dir: Some(dir.path().into()),
             };
@@ -2171,11 +2471,13 @@ mod tests {
     fn directory_is_an_error() {
         let options = Options {
             path: Some(std::env::temp_dir()),
+            dir: None,
             mode: Mode::Edit,
             lang: Lang::En,
             encoding: None,
             line: None,
             config: Config::default(),
+            config_path: None,
             warnings: Vec::new(),
             state_dir: None,
         };

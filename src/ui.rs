@@ -9,14 +9,17 @@ use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::app::browse::PanelPlace;
 use crate::app::{App, TextArea};
 use crate::buffer::Eol;
 use crate::command::{Command, Mode};
 use crate::dialog::{Dialog, Field, Menu};
+use crate::files::Kind;
 use crate::layout;
 use crate::mdline;
 use crate::pane::MARGIN;
 use crate::preview::Item;
+use crate::settings::Item as Setting;
 use crate::style::{Mark, Tone};
 
 const BAR: Style = Style::new().add_modifier(Modifier::REVERSED);
@@ -38,6 +41,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     .areas(frame.area());
     let screen = frame.area();
     frame.buffer_mut().set_style(screen, app.theme.base());
+
+    let work = body;
+    let place = app.panel_place(work.width);
+    let (panel, body) = match place {
+        PanelPlace::Hidden => (None, work),
+        PanelPlace::Full => (Some(work), work),
+        PanelPlace::Side(width) => {
+            let [panel, body] =
+                Layout::horizontal([Constraint::Length(width), Constraint::Min(0)]).areas(work);
+            (Some(panel), body)
+        }
+    };
+    let covered = place == PanelPlace::Full;
+    let panel_area = panel.map(|p| TextArea {
+        x: p.x,
+        y: p.y,
+        width: p.width,
+        height: p.height,
+    });
+    app.prepare_files(panel_area, body.x, covered);
 
     let digits = app.buffer.line_count().to_string().len() as u16;
     let mut gutter = if app.view.settings.line_numbers {
@@ -66,7 +89,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(header_text(app, header.width)).style(BAR),
         header,
     );
-    if body.width > 0 && body.height > 0 {
+    if let Some(panel) = panel {
+        draw_files(frame, app, panel);
+    }
+    if body.width > 0 && body.height > 0 && !covered {
         match app.mode {
             Mode::Edit => draw_text(frame, app, area, gutter),
             Mode::View => draw_preview(frame, app, body),
@@ -81,8 +107,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         _ => frame.render_widget(Paragraph::new(footer_text(app)).style(BAR), footer),
     }
     match &app.dialog {
-        Some(Dialog::Menu(menu)) => draw_menu(frame, menu, body, app.theme.base()),
-        _ if app.help => draw_help(frame, app, body),
+        Some(Dialog::Menu(menu)) => draw_menu(frame, menu, work, app.theme.base()),
+        Some(Dialog::Settings(p)) => draw_settings(frame, app, p.selected, work),
+        _ if app.help => draw_help(frame, app, work),
         _ => {}
     }
 }
@@ -95,16 +122,130 @@ fn header_text(app: &App, width: u16) -> String {
     };
     let mark = if app.is_modified() { '*' } else { ' ' };
     let room = (width as usize).saturating_sub(2);
-    if name.width() <= room {
-        return format!("{mark}{name}");
+    format!("{mark}{}", tail(&name, room))
+}
+
+/// Конец строки, если целиком она не помещается.
+fn tail(text: &str, room: usize) -> String {
+    if text.width() <= room {
+        return text.to_owned();
     }
-    let mut tail = name.as_str();
+    let mut tail = text;
     while tail.width() + 1 > room && !tail.is_empty() {
         let mut graphemes = tail.graphemes(true);
         graphemes.next();
         tail = graphemes.as_str();
     }
-    format!("{mark}…{tail}")
+    format!("…{tail}")
+}
+
+/// Начало строки, если целиком она не помещается.
+fn head(text: &str, room: usize) -> String {
+    if text.width() <= room {
+        return text.to_owned();
+    }
+    let mut head = text;
+    while head.width() + 1 > room && !head.is_empty() {
+        let last = head.graphemes(true).next_back().map_or(0, str::len);
+        head = &head[..head.len() - last];
+    }
+    format!("{head}…")
+}
+
+fn draw_files(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(browser) = &app.browser else { return };
+    if area.width < 2 || area.height == 0 {
+        return;
+    }
+    let s = app.lang.strings();
+    let focused = app.files_focused();
+    let dim = app.theme.style(Mark::tone(Tone::Dim));
+    let heading = app.theme.style(Mark::tone(Tone::Heading).bold());
+    let border = area.x + area.width - 1;
+    let room = area.width as usize - 1;
+    let current = app.path.as_deref();
+    let current = current.and_then(|p| std::path::absolute(p).ok());
+    let buf = frame.buffer_mut();
+    for y in area.y..area.y + area.height {
+        buf.set_string(border, y, "│", dim);
+    }
+    let root = printable(&browser.tree.root().display().to_string());
+    buf.set_string(area.x, area.y, tail(&root, room), heading);
+    for (number, (row, selected)) in browser.tree.visible().enumerate() {
+        let y = area.y + 1 + number as u16;
+        if y >= area.y + area.height {
+            break;
+        }
+        let indent = "  ".repeat(row.depth.min(room / 4));
+        let (sign, name) = match row.kind {
+            Kind::Up => ("", "..".to_owned()),
+            Kind::Dir { open: true } => ("▾ ", printable(&row.name)),
+            Kind::Dir { open: false } => ("▸ ", printable(&row.name)),
+            Kind::File => ("  ", printable(&row.name)),
+            Kind::Unreadable => ("  ", format!("({})", s.files_unreadable)),
+            Kind::Cut => ("  ", format!("({})", s.files_cut)),
+        };
+        let mut style = match row.kind {
+            Kind::Unreadable | Kind::Cut => dim,
+            Kind::Dir { .. } | Kind::Up => app.theme.style(Mark::tone(Tone::Link)),
+            Kind::File if Some(&row.path) == current.as_ref() => heading,
+            Kind::File => app.theme.style(Mark::TEXT),
+        };
+        if selected && focused {
+            style = style.patch(SELECTED);
+        }
+        let text = head(&format!(" {indent}{sign}{name}"), room);
+        buf.set_string(area.x, y, &text, style);
+        let end = area.x + text.width() as u16;
+        for x in end..border {
+            buf[(x, y)].set_style(style);
+        }
+    }
+}
+
+fn draw_settings(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
+    let s = app.lang.strings();
+    let name_width = |item: &Setting| app.lang.setting(*item).width();
+    let names = Setting::ALL.iter().map(name_width).max().unwrap_or(0);
+    const VALUE: usize = 16;
+    let width = names + VALUE + 7;
+    let rect = popup(area, width, Setting::ALL.len() + 1);
+    let room = (rect.width as usize).saturating_sub(4);
+    // На низком экране видна часть списка вокруг выбранного.
+    let rows = rect.height.saturating_sub(3).max(1) as usize;
+    let first = selected
+        .saturating_sub(rows / 2)
+        .min(Setting::ALL.len().saturating_sub(rows));
+    let mut lines: Vec<Line> = Setting::ALL
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(index, item)| {
+            let name = app.lang.setting(*item);
+            let value = printable(&app.lang.setting_value(*item, &app.values));
+            let value = head(&value, VALUE);
+            let gap = " ".repeat(names.saturating_sub(name.width()) + 2);
+            let style = if index == selected {
+                SELECTED
+            } else {
+                Style::new()
+            };
+            Line::styled(format!(" {name}{gap}{value} "), style)
+        })
+        .collect();
+    let path = app.config_path.as_ref();
+    let path = path.map_or(String::new(), |p| printable(&p.display().to_string()));
+    let dim = app.theme.style(Mark::tone(Tone::Dim));
+    lines.push(Line::styled(format!(" {}", tail(&path, room)), dim));
+    let block = Block::bordered()
+        .title(format!(" {} ", s.settings_title))
+        .title_bottom(format!(" {} ", s.settings_hint));
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines).style(app.theme.base()).block(block),
+        rect,
+    );
 }
 
 fn draw_text(frame: &mut Frame, app: &mut App, area: TextArea, gutter: u16) {
@@ -188,6 +329,7 @@ fn draw_text(frame: &mut Frame, app: &mut App, area: TextArea, gutter: u16) {
             if let Some(column) = cursor_x
                 && app.dialog.is_none()
                 && !app.help
+                && !app.files_focused()
                 && column >= view.left
             {
                 let x = (area.x as usize + column - view.left).min(right as usize - 1);
@@ -280,6 +422,9 @@ fn footer_text(app: &App) -> String {
         return format!(" {mode} | {}", printable(message));
     }
     let s = app.lang.strings();
+    if app.files_focused() {
+        return format!(" {}", s.files_hint);
+    }
     if app.mode == Mode::View && !app.pane.is_ready() {
         return format!(" {mode} | {}", app.preview_note());
     }
@@ -315,17 +460,36 @@ fn footer_text(app: &App) -> String {
         (_, Eol::Lf) => "LF",
         (_, Eol::Crlf) => "CRLF",
     };
-    let keys = |c| app.keymap.chords(c).join("/");
-    format!(
-        " {mode} | {place} | {} | {eol} | {}: {} | {}: {} | {}: {}",
-        app.format,
-        keys(Command::ToggleMode),
-        app.lang.mode(app.mode.toggled()).to_lowercase(),
-        keys(Command::Help),
-        s.help,
-        keys(Command::Quit),
-        s.quit,
-    )
+    // Сначала главное: на узком экране конец не виден.
+    let mut text = format!(" {mode} | {place} | {} | {eol}", app.format);
+    let toggled = app.lang.mode(app.mode.toggled()).to_lowercase();
+    let command = |c| app.lang.command(c).to_lowercase();
+    for (keys, name) in [
+        (first_key(app, Command::ToggleMode), toggled),
+        (first_key(app, Command::Help), s.help.to_owned()),
+        (
+            app.keymap.chords(Command::Quit).join("/"),
+            s.quit.to_owned(),
+        ),
+        (
+            first_key(app, Command::Settings),
+            command(Command::Settings),
+        ),
+        (first_key(app, Command::Files), command(Command::Files)),
+    ] {
+        if !keys.is_empty() {
+            text += &format!(" | {keys}: {name}");
+        }
+    }
+    text
+}
+
+fn first_key(app: &App, command: Command) -> String {
+    app.keymap
+        .chords(command)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 fn draw_field(frame: &mut Frame, field: &Field, area: Rect) {
@@ -387,14 +551,32 @@ fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect, base: Style) {
 }
 
 fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
-    let rows: Vec<Line> = Command::ALL
+    const COLUMN: usize = 38;
+    let rows: Vec<String> = Command::ALL
         .iter()
         .map(|c| {
             let keys = app.keymap.chords(*c).join(", ");
-            Line::from(format!(" {keys:<14} {}", app.lang.command(*c)))
+            format!(" {keys:<14} {}", app.lang.command(*c))
         })
         .collect();
-    let rect = popup(area, 40, rows.len());
+    // Не помещается по высоте: вторая колонка, если хватает ширины.
+    let high = rows.len() + 2 <= area.height as usize;
+    let wide = area.width as usize >= 2 * COLUMN + 2;
+    let (columns, count) = match high || !wide {
+        true => (1, rows.len()),
+        false => (2, rows.len().div_ceil(2)),
+    };
+    let rows: Vec<Line> = (0..count)
+        .map(|y| {
+            let mut line = rows[y].clone();
+            if let Some(second) = rows.get(y + count) {
+                let gap = COLUMN.saturating_sub(line.width());
+                line = format!("{line}{}{second}", " ".repeat(gap));
+            }
+            Line::from(line)
+        })
+        .collect();
+    let rect = popup(area, columns * COLUMN + 2, rows.len());
     let block = Block::bordered().title(app.lang.strings().help_title);
     frame.render_widget(Clear, rect);
     frame.render_widget(
@@ -425,11 +607,13 @@ mod tests {
     fn app(text: &str) -> App {
         let options = Options {
             path: None,
+            dir: None,
             mode: Mode::Edit,
             lang: Lang::Ru,
             encoding: None,
             line: None,
             config: crate::config::Config::default(),
+            config_path: None,
             warnings: Vec::new(),
             state_dir: None,
         };
@@ -464,7 +648,8 @@ mod tests {
         assert!(rows[0].starts_with(" без имени "));
         assert!(rows[1].starts_with("1 # Привет"));
         assert!(rows[5].contains("ПРАВКА | 1:1 | UTF-8 | LF"));
-        assert!(rows[5].contains("F5/Ctrl+E"));
+        assert!(rows[5].contains("F5: просмотр"));
+        assert!(rows[5].contains("F9: настройки"));
         press(&mut app, "f5");
         assert!(screen(&mut app, 100, 6)[5].contains("ПРОСМОТР"));
     }
@@ -585,5 +770,87 @@ mod tests {
         assert_eq!(printable("a\x1b[31m\u{202e}\tb"), "a\u{fffd}[31m\u{fffd} b");
         let mut app = app("a\x1b[31mb");
         assert!(screen(&mut app, 40, 4).iter().all(|r| !r.contains('\x1b')));
+    }
+
+    #[test]
+    fn panel_shows_files_beside_the_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("каталог")).unwrap();
+        std::fs::write(dir.path().join("файл с очень длинным именем.md"), "").unwrap();
+        std::fs::write(dir.path().join("\u{1b}[31m.md"), "").unwrap_or(());
+        let mut app = app("# Привет\n");
+        app.config_path = None;
+        press(&mut app, "f4");
+        app.browser.as_mut().unwrap().tree = crate::files::Tree::new(dir.path(), false);
+        let rows = screen(&mut app, 100, 12);
+        let shown = rows.join("\n");
+        assert!(rows[2].starts_with(" .."), "{shown}");
+        assert!(rows[3].starts_with(" ▸ каталог"), "{shown}");
+        assert!(shown.contains("файл с очень длинным") && shown.contains('…'));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(
+            rows[1]
+                .chars()
+                .skip(29)
+                .collect::<String>()
+                .starts_with("│1 # Привет")
+        );
+        assert!(rows[11].contains("ФАЙЛЫ"));
+        // Узкий экран: панель вместо текста, без неё текст целиком.
+        let rows = screen(&mut app, 40, 12);
+        assert!(!rows.join("").contains("Привет"));
+        press(&mut app, "esc");
+        let rows = screen(&mut app, 40, 12);
+        assert!(rows[1].starts_with("1 # Привет"));
+        for (width, height) in [(1, 1), (2, 2), (3, 5), (17, 3), (60, 2)] {
+            screen(&mut app, width, height);
+            press(&mut app, "f4");
+            screen(&mut app, width, height);
+            press(&mut app, "esc");
+        }
+    }
+
+    #[test]
+    fn settings_show_values_and_the_path() {
+        let mut app = app("текст\n");
+        app.config_path = Some("/home/кто-то/.config/ruconmd/config.toml".into());
+        press(&mut app, "f9");
+        let shown = screen(&mut app, 100, 24).join("\n");
+        for text in [
+            "Настройки",
+            "Язык",
+            "авто",
+            "Тема",
+            "dark",
+            "Панель: ширина",
+            "Открыть файл настроек",
+            "config.toml",
+            "Enter: сохранить",
+        ] {
+            assert!(shown.contains(text), "{text}: {shown}");
+        }
+        press(&mut app, "down");
+        press(&mut app, "right");
+        assert!(screen(&mut app, 100, 24).join("").contains("light"));
+        // На низком экране выбранное видно.
+        press(&mut app, "end");
+        let shown = screen(&mut app, 100, 8).join("\n");
+        assert!(shown.contains("Открыть файл настроек"), "{shown}");
+        for (width, height) in [(1, 1), (5, 3), (30, 4)] {
+            screen(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn help_fits_a_usual_terminal() {
+        let mut app = app("");
+        press(&mut app, "f1");
+        let shown = screen(&mut app, 80, 24).join("\n");
+        for command in Command::ALL {
+            assert!(
+                shown.contains(app.lang.command(*command)),
+                "{command:?}: {shown}"
+            );
+        }
     }
 }

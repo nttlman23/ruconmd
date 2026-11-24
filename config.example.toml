@@ -1,4 +1,5 @@
-# Настройки ruconmd. Все значения ниже совпадают со значениями по умолчанию.
+# Настройки ruconmd. Большую часть можно менять в самой программе: F9.
+# Все значения ниже совпадают со значениями по умолчанию.
 # Linux:   ~/.config/ruconmd/config.toml
 # Windows: %APPDATA%\ruconmd\config.toml
 
@@ -21,6 +22,10 @@ backup = true            # файл .bak при первом сохранени�
 autosave = false
 autosave_delay_sec = 5   # 1..3600
 
+[files]
+all = false              # true: и скрытое, и файлы любых типов
+width = 30               # ширина панели файлов, 16..80
+
 # Список заменяет клавиши команды целиком, пустой список отключает команду.
 # Модификаторы: ctrl, alt, shift. Клавиши: буквы, f1..f12, space, enter, tab, esc,
 # left, right, up, down, home, end, pageup, pagedown, insert, delete, backspace.
@@ -30,6 +35,8 @@ toggle_mode = ["f5", "ctrl+e"]
 save = ["ctrl+s", "f2"]
 save_as = ["f12"]
 quit = ["ctrl+q", "f10"]
+files = ["f4", "ctrl+o"]
+settings = ["f9"]
 undo = ["ctrl+z"]
 redo = ["ctrl+y"]
 copy = ["ctrl+c"]

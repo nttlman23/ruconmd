@@ -23,6 +23,9 @@ pub struct Config {
     /// `None`: по локали системы.
     pub lang: Option<Lang>,
     pub theme: Theme,
+    pub theme_name: String,
+    /// Все темы, из которых можно выбирать.
+    pub themes: Vec<(String, Theme)>,
     pub editor: Settings,
     /// Наибольшая ширина просмотра, 0: вся ширина окна.
     pub preview_width: usize,
@@ -30,19 +33,36 @@ pub struct Config {
     pub backup: bool,
     /// Через сколько после правки сохранять файл.
     pub autosave: Option<Duration>,
+    /// Задержка из конфига, даже если автосохранение выключено, секунды.
+    pub autosave_delay: u64,
+    /// Показывать в панели скрытое и файлы любых типов.
+    pub files_all: bool,
+    pub files_width: u16,
     pub keymap: Keymap,
 }
+
+pub const MAX_TAB: usize = 16;
+/// Наименьшая и наибольшая ширина просмотра, кроме 0.
+pub const MIN_WIDTH: usize = 20;
+pub const MAX_WIDTH: usize = 1000;
+/// Ширина панели файлов.
+pub const FILES_WIDTH: std::ops::RangeInclusive<u16> = 16..=80;
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             lang: None,
             theme: Theme::DARK,
+            theme_name: "dark".into(),
+            themes: vec![("dark".into(), Theme::DARK), ("light".into(), Theme::LIGHT)],
             editor: Settings::default(),
             preview_width: 100,
             images: Wanted::Auto,
             backup: true,
             autosave: None,
+            autosave_delay: 5,
+            files_all: false,
+            files_width: 30,
             keymap: Keymap::default(),
         }
     }
@@ -169,8 +189,9 @@ impl Reader {
                 ("editor", Value::Table(t)) => self.editor(t),
                 ("preview", Value::Table(t)) => self.preview(t),
                 ("save", Value::Table(t)) => self.save(t),
+                ("files", Value::Table(t)) => self.files(t),
                 ("keys", Value::Table(t)) => self.keys(t),
-                ("editor" | "preview" | "save" | "keys" | "themes", _) => {
+                ("editor" | "preview" | "save" | "files" | "keys" | "themes", _) => {
                     self.warn(key, Problem::BadValue);
                 }
                 _ => self.warn(key, Problem::Unknown),
@@ -184,7 +205,7 @@ impl Reader {
             let place = format!("editor.{key}");
             match key.as_str() {
                 "tab_width" => {
-                    self.set(&place, number(v, 1, 16), |c, n| c.editor.tab_width = n);
+                    self.set(&place, number(v, 1, MAX_TAB), |c, n| c.editor.tab_width = n);
                 }
                 "wrap" => self.set(&place, v.as_bool(), |c, b| c.editor.wrap = b),
                 "line_numbers" => {
@@ -200,7 +221,7 @@ impl Reader {
             let place = format!("preview.{key}");
             match key.as_str() {
                 "max_width" => {
-                    let width = number(v, 0, 1000).filter(|n| *n == 0 || *n >= 20);
+                    let width = number(v, 0, MAX_WIDTH).filter(|n| *n == 0 || *n >= MIN_WIDTH);
                     self.set(&place, width, |c, n| c.preview_width = n);
                 }
                 "images" => {
@@ -218,7 +239,7 @@ impl Reader {
 
     fn save(&mut self, table: &Table) {
         let mut autosave = false;
-        let mut delay = 5;
+        let mut delay = self.config.autosave_delay;
         for (key, v) in table {
             let place = format!("save.{key}");
             match key.as_str() {
@@ -231,6 +252,22 @@ impl Reader {
             }
         }
         self.config.autosave = autosave.then(|| Duration::from_secs(delay));
+        self.config.autosave_delay = delay;
+    }
+
+    fn files(&mut self, table: &Table) {
+        for (key, v) in table {
+            let place = format!("files.{key}");
+            match key.as_str() {
+                "all" => self.set(&place, v.as_bool(), |c, b| c.files_all = b),
+                "width" => {
+                    let (min, max) = (*FILES_WIDTH.start(), *FILES_WIDTH.end());
+                    let width = number(v, min.into(), max.into());
+                    self.set(&place, width, |c, n| c.files_width = n as u16);
+                }
+                _ => self.warn(place, Problem::Unknown),
+            }
+        }
     }
 
     fn keys(&mut self, table: &Table) {
@@ -286,31 +323,34 @@ impl Reader {
     }
 
     fn theme(&mut self, root: &Table) {
-        let name = match root.get("theme") {
-            None => return self.check_themes(root),
-            Some(v) => v.as_str(),
+        self.check_themes(root);
+        let Some(value) = root.get("theme") else {
+            return;
         };
-        let custom = root.get("themes").and_then(Value::as_table);
-        match name {
-            Some("dark") => self.config.theme = Theme::DARK,
-            Some("light") => self.config.theme = Theme::LIGHT,
-            Some(name) => match custom.and_then(|t| t.get(name)).and_then(Value::as_table) {
-                Some(table) => self.config.theme = custom_theme(name, table).0,
-                None => self.warn("theme", Problem::BadValue),
-            },
+        let themes = self.config.themes.iter();
+        match themes.clone().find(|(n, _)| value.as_str() == Some(n)) {
+            Some((name, theme)) => {
+                (self.config.theme_name, self.config.theme) = (name.clone(), theme.clone());
+            }
             None => self.warn("theme", Problem::BadValue),
         }
-        self.check_themes(root);
     }
 
-    /// Предупреждает об ошибках во всех темах, а не только в выбранной.
+    /// Собирает темы и предупреждает об ошибках во всех, а не только в выбранной.
     fn check_themes(&mut self, root: &Table) {
         let Some(themes) = root.get("themes").and_then(Value::as_table) else {
             return;
         };
         for (name, value) in themes {
             match value.as_table() {
-                Some(table) => self.warnings.extend(custom_theme(name, table).1),
+                Some(table) => {
+                    let (theme, warnings) = custom_theme(name, table);
+                    self.warnings.extend(warnings);
+                    // Имена встроенных тем заняты.
+                    if !matches!(name.as_str(), "dark" | "light") {
+                        self.config.themes.push((name.clone(), theme));
+                    }
+                }
                 None => self.warn(format!("themes.{name}"), Problem::BadValue),
             }
         }
@@ -355,6 +395,9 @@ fn number(value: &Value, min: usize, max: usize) -> Option<usize> {
 impl Config {
     pub fn fitted(mut self, depth: Depth) -> Self {
         self.theme = self.theme.fitted(depth);
+        for (_, theme) in &mut self.themes {
+            *theme = theme.clone().fitted(depth);
+        }
         self
     }
 }
@@ -384,6 +427,9 @@ mod tests {
         assert_eq!(config.editor, default.editor);
         assert_eq!(config.preview_width, default.preview_width);
         assert_eq!((config.backup, config.autosave), (true, None));
+        assert_eq!(config.autosave_delay, default.autosave_delay);
+        assert_eq!(config.files_all, default.files_all);
+        assert_eq!(config.files_width, default.files_width);
         for command in Command::ALL {
             assert!(
                 EXAMPLE.contains(&format!("\n{} = [", command.name())),

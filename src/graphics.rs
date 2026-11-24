@@ -25,6 +25,16 @@ pub enum Wanted {
 }
 
 impl Wanted {
+    /// Имена протоколов в конфиге.
+    pub const NAMES: [&'static str; 3] = ["kitty", "sixel", "iterm2"];
+
+    /// Имя выбранного протокола.
+    pub fn name(self) -> Option<&'static str> {
+        Self::NAMES
+            .into_iter()
+            .find(|name| Self::from_name(name) == Some(self))
+    }
+
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "kitty" => Some(Self::Force(ProtocolType::Kitty)),

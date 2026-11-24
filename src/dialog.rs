@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use crate::buffer::Eol;
 use crate::encoding::{Enc, Format};
 use crate::key::{Chord, Key};
+use crate::settings::Values;
 
 /// На сколько пунктов сдвигают меню PgUp и PgDn.
 const PAGE: usize = 10;
@@ -106,11 +107,20 @@ pub struct Menu {
     pub selected: usize,
 }
 
+/// Диалог настроек.
+#[derive(Debug)]
+pub struct Preferences {
+    pub selected: usize,
+    /// Что было до изменений.
+    pub before: Values,
+}
+
 #[derive(Debug)]
 pub enum Dialog {
     Field(Field),
     Menu(Menu),
     Replace(Replacing),
+    Settings(Preferences),
 }
 
 /// Что получилось после нажатия.
@@ -208,8 +218,8 @@ impl Dialog {
         match self {
             Dialog::Field(field) => field.key(chord),
             Dialog::Menu(menu) => menu.key(chord),
-            // Клавиши замены обрабатывает приложение.
-            Dialog::Replace(_) => Outcome::Open,
+            // Клавиши замены и настроек обрабатывает приложение.
+            Dialog::Replace(_) | Dialog::Settings(_) => Outcome::Open,
         }
     }
 }

@@ -39,6 +39,8 @@ commands! {
     Save = "save",
     SaveAs = "save_as",
     Quit = "quit",
+    Files = "files",
+    Settings = "settings",
     Undo = "undo",
     Redo = "redo",
     Copy = "copy",

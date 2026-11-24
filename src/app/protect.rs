@@ -31,6 +31,7 @@ impl App {
         self.check_disk(now);
         self.run_autosave(now);
         self.update_recovery(now);
+        self.refresh_files(now);
     }
 
     /// Через сколько вызвать [`App::tick`], если ввода нет.

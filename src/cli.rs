@@ -15,6 +15,7 @@ use crate::command::Mode;
 use crate::encoding::Enc;
 use crate::graphics::Graphics;
 use crate::i18n::Lang;
+use crate::pane::Shown;
 use crate::style::Depth;
 use crate::term::{Events, Terminal};
 use crate::{code, config, diag, graphics, links, ui, update};
@@ -22,7 +23,7 @@ use crate::{code, config, diag, graphics, links, ui, update};
 #[derive(Debug, Parser)]
 #[command(version, about)]
 pub struct Args {
-    /// File to open
+    /// File or directory to open
     pub file: Option<PathBuf>,
     /// Start in preview mode
     #[arg(long)]
@@ -63,13 +64,19 @@ pub fn run() -> io::Result<()> {
         return diag::run(lang, &config.keymap);
     }
 
+    let (path, dir) = match args.file {
+        Some(path) if path.is_dir() => (None, Some(path)),
+        path => (path, None),
+    };
     let options = Options {
-        path: args.file,
+        path,
+        dir,
         mode: if args.view { Mode::View } else { Mode::Edit },
         lang,
         encoding: args.encoding,
         line: args.line,
         config,
+        config_path: args.config.or_else(config::default_path),
         warnings: warnings.clone(),
         state_dir: config::state_dir(),
     };
@@ -105,11 +112,11 @@ fn event_loop(app: &mut App, stop: &AtomicBool) -> io::Result<End> {
         terminal.draw(|frame| ui::draw(frame, app))?;
         // Прежнее место картинки само не стирается.
         let traces = app.pane.graphics().is_some_and(Graphics::leaves_traces);
-        if traces && drawn != app.images_on_screen() && !drawn.is_empty() {
+        if traces && drawn != images(app) && !drawn.is_empty() {
             terminal.clear()?;
             terminal.draw(|frame| ui::draw(frame, app))?;
         }
-        drawn = app.images_on_screen();
+        drawn = images(app);
         // Всё, что уже накопилось, обрабатывается до следующей отрисовки.
         let mut timeout = app.sleep();
         while let Some(batch) = events.next(timeout)? {
@@ -126,6 +133,13 @@ fn event_loop(app: &mut App, stop: &AtomicBool) -> io::Result<End> {
         }
     }
     Ok(End::Quit)
+}
+
+/// Картинки на экране вместе с местом, от которого они отсчитаны.
+fn images(app: &App) -> Vec<(u16, Shown)> {
+    let origin = app.origin();
+    let shown = app.images_on_screen().into_iter();
+    shown.map(|image| (origin, image)).collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -180,11 +194,13 @@ mod tests {
     fn app(dir: &std::path::Path) -> App {
         let options = Options {
             path: Some(dir.join("a.md")),
+            dir: None,
             mode: Mode::Edit,
             lang: Lang::En,
             encoding: None,
             line: None,
             config: Config::default(),
+            config_path: None,
             warnings: Vec::new(),
             state_dir: Some(dir.join("state")),
         };

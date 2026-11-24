@@ -38,6 +38,8 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::Save, &["ctrl+s", "f2"]),
     (Command::SaveAs, &["f12"]),
     (Command::Quit, &["ctrl+q", "f10"]),
+    (Command::Files, &["f4", "ctrl+o"]),
+    (Command::Settings, &["f9"]),
     (Command::Undo, &["ctrl+z"]),
     (Command::Redo, &["ctrl+y"]),
     (Command::Copy, &["ctrl+c"]),

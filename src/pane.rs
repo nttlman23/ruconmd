@@ -26,6 +26,7 @@ const SYNC_BYTES: usize = 256 * 1024;
 struct Key {
     revision: u64,
     width: usize,
+    tab: usize,
 }
 
 /// Место, которое надо показать: байт исходного текста и строка экрана.
@@ -289,6 +290,7 @@ impl Pane {
         let key = Key {
             revision: buffer.revision(),
             width,
+            tab,
         };
         self.wanted = Some(key);
         if self.shown != Some(key) && self.failed != Some(key) && self.job.is_none() {
@@ -666,6 +668,18 @@ mod tests {
         pane.prepare(&buffer, 60, 10, 4);
         let after = pane.source_at_top();
         assert!(after <= before && before - after < 130, "{before} {after}");
+    }
+
+    #[test]
+    fn tab_width_change_rebuilds_the_preview() {
+        let buffer = Buffer::new("```\n\t\t\tкод\n```\n");
+        let mut pane = Pane::default();
+        let mut shown = |tab| {
+            pane.prepare(&buffer, 20, 10, tab);
+            pane.doc.lines.clone()
+        };
+        let narrow = shown(2);
+        assert_ne!(narrow, shown(8));
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 use crate::command::{Command, Mode};
 use crate::config::{Problem, Warning};
+use crate::graphics::Wanted;
+use crate::settings::{Item, Values};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Lang {
@@ -40,6 +42,21 @@ pub struct Strings {
     pub read_as: &'static str,
     pub preparing: &'static str,
     pub preview_failed: &'static str,
+    pub files_hint: &'static str,
+    pub files_title: &'static str,
+    pub files_unreadable: &'static str,
+    pub files_cut: &'static str,
+    pub settings_title: &'static str,
+    pub settings_hint: &'static str,
+    pub settings_saved: &'static str,
+    pub settings_images_later: &'static str,
+    pub settings_damaged: &'static str,
+    pub settings_no_file: &'static str,
+    pub yes: &'static str,
+    pub no: &'static str,
+    pub auto: &'static str,
+    pub seconds: &'static str,
+    pub whole_width: &'static str,
     pub update_no_platform: &'static str,
     pub update_none: &'static str,
     pub update_loading: &'static str,
@@ -130,6 +147,21 @@ const RU: Strings = Strings {
     read_as: "Прочитать как",
     preparing: "Готовлю просмотр…",
     preview_failed: "Просмотр построить не удалось",
+    files_hint: "ФАЙЛЫ | Enter: открыть | Backspace: каталог выше | Esc: к тексту",
+    files_title: "Файлы",
+    files_unreadable: "нет доступа",
+    files_cut: "показаны не все",
+    settings_title: "Настройки",
+    settings_hint: "←→: изменить  Enter: сохранить  Esc: отмена",
+    settings_saved: "Настройки сохранены",
+    settings_images_later: "картинки: при следующем запуске",
+    settings_damaged: "в файле ошибка, исправьте его вручную",
+    settings_no_file: "Неизвестно, где хранить настройки",
+    yes: "да",
+    no: "нет",
+    auto: "авто",
+    seconds: "с",
+    whole_width: "вся ширина",
     update_no_platform: "для этой системы готовых файлов нет",
     update_none: "Новой версии нет, установлена",
     update_loading: "Загружаю обновление",
@@ -220,6 +252,21 @@ const EN: Strings = Strings {
     read_as: "Reread as",
     preparing: "Preparing preview…",
     preview_failed: "Cannot build the preview",
+    files_hint: "FILES | Enter: open | Backspace: parent | Esc: to the text",
+    files_title: "Files",
+    files_unreadable: "no access",
+    files_cut: "not all shown",
+    settings_title: "Settings",
+    settings_hint: "←→: change  Enter: save  Esc: cancel",
+    settings_saved: "Settings saved",
+    settings_images_later: "images: on the next start",
+    settings_damaged: "the file has an error, fix it by hand",
+    settings_no_file: "No place to keep the settings",
+    yes: "yes",
+    no: "no",
+    auto: "auto",
+    seconds: "s",
+    whole_width: "whole width",
     update_no_platform: "no builds for this system",
     update_none: "No newer version, installed",
     update_loading: "Downloading the update",
@@ -349,6 +396,8 @@ impl Lang {
             Command::Save => ("Сохранить", "Save"),
             Command::SaveAs => ("Сохранить как", "Save as"),
             Command::Quit => ("Выход", "Quit"),
+            Command::Files => ("Файлы", "Files"),
+            Command::Settings => ("Настройки", "Settings"),
             Command::Undo => ("Отменить", "Undo"),
             Command::Redo => ("Повторить", "Redo"),
             Command::Copy => ("Копировать", "Copy"),
@@ -375,6 +424,61 @@ impl Lang {
         match self {
             Self::Ru => ru,
             Self::En => en,
+        }
+    }
+}
+
+impl Lang {
+    /// Название параметра в диалоге настроек.
+    pub fn setting(self, item: Item) -> &'static str {
+        let (ru, en) = match item {
+            Item::Language => ("Язык", "Language"),
+            Item::Theme => ("Тема", "Theme"),
+            Item::TabWidth => ("Ширина табуляции", "Tab width"),
+            Item::Wrap => ("Перенос длинных строк", "Wrap long lines"),
+            Item::LineNumbers => ("Номера строк", "Line numbers"),
+            Item::PreviewWidth => ("Ширина просмотра", "Preview width"),
+            Item::Images => ("Картинки", "Images"),
+            Item::Backup => ("Резервная копия .bak", "Backup copy .bak"),
+            Item::Autosave => ("Автосохранение", "Autosave"),
+            Item::AutosaveDelay => ("Задержка автосохранения", "Autosave delay"),
+            Item::FilesAll => ("Панель: все файлы", "Panel: all files"),
+            Item::FilesWidth => ("Панель: ширина", "Panel: width"),
+            Item::OpenFile => ("Открыть файл настроек", "Open the settings file"),
+        };
+        match self {
+            Self::Ru => ru,
+            Self::En => en,
+        }
+    }
+
+    /// Значение параметра, как его видит пользователь.
+    pub fn setting_value(self, item: Item, values: &Values) -> String {
+        let s = self.strings();
+        let flag = |on: bool| if on { s.yes } else { s.no }.to_owned();
+        match item {
+            Item::Language => match values.lang {
+                None => s.auto.to_owned(),
+                Some(Self::Ru) => "русский".to_owned(),
+                Some(Self::En) => "English".to_owned(),
+            },
+            Item::Theme => values.theme.clone(),
+            Item::TabWidth => values.tab_width.to_string(),
+            Item::Wrap => flag(values.wrap),
+            Item::LineNumbers => flag(values.line_numbers),
+            Item::PreviewWidth if values.preview_width == 0 => s.whole_width.to_owned(),
+            Item::PreviewWidth => values.preview_width.to_string(),
+            Item::Images => match values.images {
+                Wanted::Auto => s.auto.to_owned(),
+                Wanted::Off => s.no.to_owned(),
+                forced => forced.name().unwrap_or_default().to_owned(),
+            },
+            Item::Backup => flag(values.backup),
+            Item::Autosave => flag(values.autosave),
+            Item::AutosaveDelay => format!("{} {}", values.autosave_delay, s.seconds),
+            Item::FilesAll => flag(values.files_all),
+            Item::FilesWidth => values.files_width.to_string(),
+            Item::OpenFile => String::new(),
         }
     }
 }

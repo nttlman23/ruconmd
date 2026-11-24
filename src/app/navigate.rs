@@ -117,7 +117,7 @@ impl App {
     }
 
     /// Переход, который может потребовать сохранить правки.
-    fn go(&mut self, location: Location) {
+    pub(super) fn go(&mut self, location: Location) {
         if !self.is_here(&location.path) && self.is_modified() {
             self.ask_unsaved(Then::Go(location));
         } else {
@@ -125,7 +125,7 @@ impl App {
         }
     }
 
-    fn is_here(&self, path: &Option<PathBuf>) -> bool {
+    pub(super) fn is_here(&self, path: &Option<PathBuf>) -> bool {
         if *path == self.path {
             return true;
         }
@@ -155,6 +155,7 @@ impl App {
                 Ok(loaded) => {
                     self.pane.reset(Some(path.clone()));
                     self.open_other(path.clone(), loaded);
+                    self.leave_files();
                 }
                 Err(e) => {
                     self.message = Some(e.to_string());
