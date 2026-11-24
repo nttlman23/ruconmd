@@ -3,6 +3,7 @@
 use std::io::{self, Stdout, stdout};
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
@@ -108,7 +109,7 @@ pub struct Batch {
     pub inputs: Vec<Input>,
 }
 
-pub struct EventReader {
+struct EventReader {
     decoder: InputDecoder,
 }
 
@@ -120,21 +121,14 @@ const PASTE_GAP: Duration = Duration::from_millis(8);
 const PASTE_SUSPECT: usize = 3;
 
 impl EventReader {
-    #[expect(clippy::new_without_default)]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             decoder: InputDecoder::new(Platform::CURRENT),
         }
     }
 
     /// Ждёт событие и забирает всё, что уже пришло следом.
-    /// `None`: за `timeout` ничего не пришло.
-    pub fn read(&mut self, timeout: Option<Duration>) -> io::Result<Option<Batch>> {
-        if let Some(timeout) = timeout
-            && !event::poll(timeout)?
-        {
-            return Ok(None);
-        }
+    fn read(&mut self) -> io::Result<Batch> {
         let mut raw = vec![event::read()?];
         let mut typed = 0;
         while raw.len() < MAX_BATCH {
@@ -155,6 +149,41 @@ impl EventReader {
             raw.push(event::read()?);
         }
         let inputs = self.decoder.decode(&raw, Instant::now());
-        Ok(Some(Batch { raw, inputs }))
+        Ok(Batch { raw, inputs })
+    }
+}
+
+/// Ввод, который читает отдельный поток.
+///
+/// Если терминал исчез, `crossterm` может не вернуться из чтения никогда. Основной
+/// цикл при этом продолжает работать и успевает записать несохранённые правки.
+pub struct Events {
+    receiver: Receiver<io::Result<Batch>>,
+}
+
+impl Events {
+    /// Запускается после [`Terminal::enter`]: тот сам читает ответы терминала.
+    pub fn start() -> Self {
+        let (sender, receiver) = channel();
+        std::thread::spawn(move || {
+            let mut reader = EventReader::new();
+            loop {
+                let batch = reader.read();
+                let failed = batch.is_err();
+                if sender.send(batch).is_err() || failed {
+                    return;
+                }
+            }
+        });
+        Self { receiver }
+    }
+
+    /// Ждёт ввод не дольше `timeout`.
+    pub fn next(&self, timeout: Duration) -> io::Result<Option<Batch>> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(batch) => batch.map(Some),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err(io::Error::other("input thread stopped")),
+        }
     }
 }

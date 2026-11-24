@@ -2,7 +2,7 @@
 name = "ruconmd"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Console Markdown editor with a full-screen preview mode"
 
 [dependencies]
@@ -17,6 +17,7 @@ regex = "1.13.2"
 ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "regex-fancy"] }
 sys-locale = "0.3.2"
+toml = { version = "1.2.2", default-features = false, features = ["parse", "serde", "std"] }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.3"
@@ -28,3 +29,6 @@ strip = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[target."cfg(unix)".dependencies]
+signal-hook = { version = "0.3", default-features = false }

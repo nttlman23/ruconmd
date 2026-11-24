@@ -1,0 +1,60 @@
+# Настройки ruconmd. Все значения ниже совпадают со значениями по умолчанию.
+# Linux:   ~/.config/ruconmd/config.toml
+# Windows: %APPDATA%\ruconmd\config.toml
+
+language = "auto"        # auto (по локали системы), ru, en
+theme = "dark"           # dark, light или имя из [themes.*]
+
+[editor]
+tab_width = 4            # 1..16
+wrap = true              # перенос длинных строк
+line_numbers = true
+
+[preview]
+max_width = 100          # 0 = вся ширина окна, иначе не меньше 20
+images = true
+
+[save]
+backup = true            # файл .bak при первом сохранении за сеанс
+autosave = false
+autosave_delay_sec = 5   # 1..3600
+
+# Список заменяет клавиши команды целиком, пустой список отключает команду.
+# Модификаторы: ctrl, alt, shift. Клавиши: буквы, f1..f12, space, enter, tab, esc,
+# left, right, up, down, home, end, pageup, pagedown, insert, delete, backspace.
+# Ctrl+M, Ctrl+I, Ctrl+H и Ctrl+[ недоступны: терминалы не отличают их от других.
+[keys]
+toggle_mode = ["f5", "ctrl+e"]
+save = ["ctrl+s", "f2"]
+save_as = ["f12"]
+quit = ["ctrl+q", "f10"]
+undo = ["ctrl+z"]
+redo = ["ctrl+y"]
+copy = ["ctrl+c"]
+cut = ["ctrl+x"]
+paste = ["ctrl+v"]
+select_all = ["ctrl+a"]
+find = ["ctrl+f"]
+find_next = ["f3"]
+find_prev = ["shift+f3"]
+replace = ["ctrl+r"]
+goto_line = ["ctrl+g"]
+outline = ["ctrl+t"]
+bold = ["ctrl+b"]
+italic = ["alt+i"]
+link = ["ctrl+k"]
+encoding = ["f8"]
+help = ["f1"]
+next_item = ["tab"]
+prev_item = ["shift+tab"]
+open_item = ["enter"]
+toggle_checkbox = ["space"]
+back = ["alt+left"]
+
+# Своя тема. Цвет: "#rrggbb", имя ("red", "lightblue"), номер 0..255, "default".
+# Роли: background, text, dim, heading, marker, quote, link, html, code,
+# keyword, string, comment, number, function, type.
+#
+# [themes.my]
+# base = "dark"
+# heading = "#7aa2f7"

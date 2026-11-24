@@ -58,6 +58,8 @@ pub struct SaveJob {
     pub overwrite: bool,
     /// Пользователь согласился потерять нечитаемые байты исходного файла.
     pub allow_lossy: bool,
+    /// Пользователь согласился записать поверх чужих изменений.
+    pub ignore_disk: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +73,12 @@ pub enum Action {
     Reload(Enc),
     SetFormat(Format),
     SetEol(Eol),
+    /// Восстановить правки прерванного сеанса или удалить их копию.
+    Restore,
+    DropCopy,
+    /// Перечитать файл, изменённый другой программой.
+    TakeDisk,
+    SaveAs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

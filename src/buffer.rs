@@ -466,18 +466,31 @@ impl Buffer {
             Eol::Crlf => unix.replace('\n', "\r\n"),
         };
         let ends = LineEnds { eol, mixed: false };
+        let previous = self.ends;
         if new == old {
             self.ends = ends;
+            return;
+        }
+        self.replace_all(&new);
+        self.ends = ends;
+        self.undo.last_mut().expect("replace added a step").ends = Some((previous, ends));
+    }
+
+    /// Заменяет весь текст как есть, одним шагом отмены. Курсор остаётся на месте.
+    pub fn replace_all(&mut self, text: &str) {
+        if *text == self.rope {
             return;
         }
         let line = self.line_of(self.cursor);
         let column = self.cursor.min(self.line_end(line)) - self.line_start(line);
         let previous = self.ends;
-        self.replace(0..self.len(), new, Kind::Other, false);
-        self.ends = ends;
-        self.cursor = self.line_start(line) + column;
+        self.replace(0..self.len(), text.to_owned(), Kind::Other, false);
+        self.ends = LineEnds::detect(text);
+        let line = line.min(self.line_count() - 1);
+        self.cursor = (self.line_start(line) + column).min(self.line_end(line));
         self.sealed = true;
         let after = self.state();
+        let ends = self.ends;
         let step = self.undo.last_mut().expect("replace added a step");
         step.after = after;
         step.ends = Some((previous, ends));
@@ -785,6 +798,20 @@ mod tests {
         b.undo();
         assert_eq!(b.text(), "a\nbc\r\nd");
         assert!(b.ends.mixed);
+    }
+
+    #[test]
+    fn replacing_everything_keeps_bytes_and_place() {
+        let mut b = Buffer::new("a\nbcd\n");
+        b.move_to(4, false);
+        b.replace_all("x\r\nyz\nw");
+        assert_eq!(b.text(), "x\r\nyz\nw");
+        assert_eq!((b.line_of(b.cursor()), b.ends.mixed), (1, true));
+        b.undo();
+        assert_eq!((b.text().as_str(), b.cursor()), ("a\nbcd\n", 4));
+        assert!(!b.ends.mixed && !b.is_modified());
+        b.replace_all("");
+        assert_eq!(b.cursor(), 0);
     }
 
     #[test]

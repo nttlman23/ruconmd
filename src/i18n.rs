@@ -1,6 +1,7 @@
 //! Тексты интерфейса.
 
 use crate::command::{Command, Mode};
+use crate::config::{Problem, Warning};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Lang {
@@ -38,6 +39,25 @@ pub struct Strings {
     pub save_in: &'static str,
     pub read_as: &'static str,
     pub preparing: &'static str,
+    pub no_recovery: &'static str,
+    pub open_elsewhere: &'static str,
+    pub found_recovery: &'static str,
+    pub changed_since: &'static str,
+    pub restore: &'static str,
+    pub not_now: &'static str,
+    pub drop_copy: &'static str,
+    pub minutes_ago: &'static str,
+    pub hours_ago: &'static str,
+    pub days_ago: &'static str,
+    pub restored: &'static str,
+    pub changed_on_disk: &'static str,
+    pub keep_mine: &'static str,
+    pub reread: &'static str,
+    pub save_as: &'static str,
+    pub gone_from_disk: &'static str,
+    pub no_backup: &'static str,
+    pub autosave_encoding: &'static str,
+    pub crashed: &'static str,
     pub outline: &'static str,
     pub no_headings: &'static str,
     pub no_links: &'static str,
@@ -100,6 +120,25 @@ const RU: Strings = Strings {
     save_in: "Сохранять в",
     read_as: "Прочитать как",
     preparing: "Готовлю просмотр…",
+    no_recovery: "Копия для восстановления не записана",
+    open_elsewhere: "В другом окне есть несохранённые правки этого файла",
+    found_recovery: "Найдены несохранённые правки",
+    changed_since: "файл с тех пор изменился",
+    restore: "Восстановить",
+    not_now: "Не сейчас",
+    drop_copy: "Удалить копию",
+    minutes_ago: "мин назад",
+    hours_ago: "ч назад",
+    days_ago: "дн назад",
+    restored: "Правки восстановлены, файл ещё не сохранён",
+    changed_on_disk: "Файл изменён другой программой",
+    keep_mine: "Оставить мою версию",
+    reread: "Перечитать файл",
+    save_as: "Сохранить как",
+    gone_from_disk: "Файл удалён с диска",
+    no_backup: "копия .bak не создана",
+    autosave_encoding: "Автосохранение: есть символы вне кодировки файла",
+    crashed: "Несохранённые правки записаны, программа предложит их при открытии файла",
     outline: "Оглавление",
     no_headings: "В документе нет заголовков",
     no_links: "Ссылок и задач нет",
@@ -162,6 +201,25 @@ const EN: Strings = Strings {
     save_in: "Save in",
     read_as: "Reread as",
     preparing: "Preparing preview…",
+    no_recovery: "Recovery copy is not written",
+    open_elsewhere: "Another window has unsaved changes to this file",
+    found_recovery: "Unsaved changes found",
+    changed_since: "the file has changed since",
+    restore: "Restore",
+    not_now: "Not now",
+    drop_copy: "Delete the copy",
+    minutes_ago: "min ago",
+    hours_ago: "h ago",
+    days_ago: "d ago",
+    restored: "Changes restored, the file is not saved yet",
+    changed_on_disk: "The file was changed by another program",
+    keep_mine: "Keep my version",
+    reread: "Reload the file",
+    save_as: "Save as",
+    gone_from_disk: "The file was deleted from disk",
+    no_backup: "no .bak copy",
+    autosave_encoding: "Autosave: some characters do not fit the file encoding",
+    crashed: "Unsaved changes are kept and will be offered when the file is opened",
     outline: "Outline",
     no_headings: "The document has no headings",
     no_links: "No links or tasks",
@@ -211,6 +269,42 @@ impl Lang {
             Self::Ru => &RU,
             Self::En => &EN,
         }
+    }
+
+    pub fn config_problem(self, warning: &Warning) -> String {
+        let ru = self == Self::Ru;
+        let pick = |a: &str, b: &str| if ru { a.to_owned() } else { b.to_owned() };
+        let problem = match &warning.problem {
+            Problem::Unreadable(e) | Problem::Syntax(e) | Problem::BadKey(e) => e.clone(),
+            Problem::Unknown => pick("неизвестный параметр", "unknown setting"),
+            Problem::BadValue => pick("недопустимое значение", "invalid value"),
+            Problem::Taken(other) => {
+                format!(
+                    "{} {other}",
+                    pick("клавиша уже у команды", "key already used by")
+                )
+            }
+            Problem::Required => pick(
+                "команде нужна клавиша, возвращены клавиши по умолчанию",
+                "a key is required, defaults restored",
+            ),
+        };
+        format!("{}: {problem}", warning.place)
+    }
+
+    /// Первое предупреждение о конфиге и число остальных.
+    pub fn config_warning(self, first: &Warning, more: usize) -> String {
+        let name = if self == Self::Ru {
+            "Конфиг"
+        } else {
+            "Config"
+        };
+        let rest = if more > 0 {
+            format!(" (+{more})")
+        } else {
+            String::new()
+        };
+        format!("{name}: {}{rest}", self.config_problem(first))
     }
 
     pub fn mode(self, mode: Mode) -> &'static str {

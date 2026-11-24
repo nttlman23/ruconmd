@@ -3,12 +3,28 @@
 use std::collections::HashMap;
 
 use crate::command::{Command, Mode};
-use crate::key::Chord;
+use crate::key::{Chord, Key};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Scope {
     Any,
     Only(Mode),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindError {
+    /// Клавиша набирает текст или двигает курсор.
+    NeededForTyping,
+}
+
+fn overlap(a: Scope, b: Scope) -> bool {
+    a == b || a == Scope::Any || b == Scope::Any
+}
+
+/// Без этих клавиш в редакторе нельзя работать.
+fn types_text(chord: Chord) -> bool {
+    let free = matches!(chord.key, Key::F(_) | Key::Insert | Key::Esc);
+    !chord.mods.ctrl && !chord.mods.alt && !free
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +79,7 @@ impl Default for Keymap {
         for (command, chords) in DEFAULTS {
             for chord in *chords {
                 let chord = chord.parse().expect("default bindings are valid");
-                map.bind(chord, *command);
+                map.bindings.insert((scope_of(*command), chord), *command);
             }
         }
         map
@@ -71,9 +87,34 @@ impl Default for Keymap {
 }
 
 impl Keymap {
-    /// Назначает сочетание команде. Возвращает команду, у которой оно отобрано.
-    pub fn bind(&mut self, chord: Chord, command: Command) -> Option<Command> {
-        self.bindings.insert((scope_of(command), chord), command)
+    /// Назначает сочетание команде, отбирая его у других команд того же режима.
+    pub fn bind(&mut self, chord: Chord, command: Command) -> Result<(), BindError> {
+        let scope = scope_of(command);
+        if scope != Scope::Only(Mode::View) && types_text(chord) {
+            return Err(BindError::NeededForTyping);
+        }
+        self.bindings
+            .retain(|(_, c), other| *c != chord || !overlap(scope_of(*other), scope));
+        self.bindings.insert((scope, chord), command);
+        Ok(())
+    }
+
+    /// Действуют ли команды в одном режиме.
+    pub fn overlap(&self, a: Command, b: Command) -> bool {
+        overlap(scope_of(a), scope_of(b))
+    }
+
+    pub fn unbind(&mut self, command: Command) {
+        self.bindings.retain(|_, c| *c != command);
+    }
+
+    pub fn restore_defaults(&mut self, command: Command) {
+        for (_, chords) in DEFAULTS.iter().filter(|(c, _)| *c == command) {
+            for chord in *chords {
+                let chord = chord.parse().expect("default bindings are valid");
+                let _ = self.bind(chord, command);
+            }
+        }
     }
 
     pub fn lookup(&self, mode: Mode, chord: Chord) -> Option<Command> {
@@ -99,7 +140,7 @@ impl Keymap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key::{Key, Mods};
+    use crate::key::Mods;
 
     #[test]
     fn defaults_cover_every_command_without_conflicts() {

@@ -1,6 +1,7 @@
 //! `--keys`: показывает, что передаёт терминал и как это понято.
 
 use std::io;
+use std::time::Duration;
 
 use ratatui::crossterm::event::{Event, KeyCode};
 use ratatui::layout::{Constraint, Layout};
@@ -12,16 +13,15 @@ use crate::i18n::Lang;
 use crate::input::Input;
 use crate::key::{Chord, Key};
 use crate::keymap::Keymap;
-use crate::term::{EventReader, Terminal};
+use crate::term::{Events, Terminal};
 use crate::ui::printable;
 
-pub fn run(lang: Lang) -> io::Result<()> {
-    let keymap = Keymap::default();
+pub fn run(lang: Lang, keymap: &Keymap) -> io::Result<()> {
     let mut log = Vec::new();
     {
         // Мышь не захватывается: правая кнопка во многих терминалах вставляет текст.
         let mut terminal = Terminal::enter(false)?;
-        let mut reader = EventReader::new();
+        let events = Events::start();
         log.push(format!(
             "ruconmd {} {} enhanced_keyboard={}",
             env!("CARGO_PKG_VERSION"),
@@ -41,7 +41,7 @@ pub fn run(lang: Lang) -> io::Result<()> {
                 let block = Block::bordered().title(s.diag_title);
                 frame.render_widget(Paragraph::new(lines).block(block), body);
             })?;
-            let Some(batch) = reader.read(None)? else {
+            let Some(batch) = events.next(Duration::from_secs(1))? else {
                 continue;
             };
             log.extend(batch.raw.iter().filter_map(describe_raw));
@@ -51,7 +51,7 @@ pub fn run(lang: Lang) -> io::Result<()> {
                 } else {
                     escapes = 0;
                 }
-                log.extend(describe(input, &keymap, lang));
+                log.extend(describe(input, keymap, lang));
             }
         }
     }

@@ -5,6 +5,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::recovery::fingerprint;
+
 /// Файлы крупнее открываются с предупреждением.
 pub const LARGE: usize = 10 * 1024 * 1024;
 
@@ -18,6 +20,10 @@ pub enum ReadError {
 
 /// Содержимое файла или `None`, если его ещё нет.
 pub fn read(path: &Path) -> Result<Option<Vec<u8>>, ReadError> {
+    Ok(read_with_meta(path)?.map(|(bytes, _)| bytes))
+}
+
+pub fn read_with_meta(path: &Path) -> Result<Option<(Vec<u8>, fs::Metadata)>, ReadError> {
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
         // Битая символическая ссылка тоже «не существует», файл создастся по ней.
@@ -30,7 +36,8 @@ pub fn read(path: &Path) -> Result<Option<Vec<u8>>, ReadError> {
     if !meta.is_file() {
         return Err(ReadError::NotRegular);
     }
-    fs::read(path).map(Some).map_err(ReadError::Io)
+    let bytes = fs::read(path).map_err(ReadError::Io)?;
+    Ok(Some((bytes, meta)))
 }
 
 /// Записывает файл так, чтобы сбой не оставил его наполовину записанным.
@@ -61,6 +68,87 @@ pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => replace(&target, bytes, None),
         Err(e) => Err(e),
     }
+}
+
+/// Записывает файл точно по этому пути: символическая ссылка заменяется, а не
+/// проходится. Права берутся у `like`.
+pub fn write_exact(path: &Path, bytes: &[u8], like: Option<&fs::Metadata>) -> io::Result<()> {
+    if path.is_dir() {
+        return Err(io::Error::other("is a directory"));
+    }
+    let (mut file, temp) = create_temp(path, true)?;
+    let result = (|| {
+        // Владельца может не выйти сменить, для копии достаточно прав.
+        if let Some(like) = like {
+            file.set_permissions(like.permissions())?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Состояние файла на диске, по которому видны чужие изменения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Disk {
+    modified: Option<SystemTime>,
+    len: u64,
+    pub hash: u64,
+}
+
+impl Disk {
+    pub fn of(meta: &fs::Metadata, bytes: &[u8]) -> Self {
+        Self {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+            hash: fingerprint(bytes),
+        }
+    }
+
+    /// Состояние только что записанного файла.
+    pub fn after_write(path: &Path, bytes: &[u8]) -> Option<Self> {
+        Some(Self::of(&fs::metadata(path).ok()?, bytes))
+    }
+
+    /// Новое состояние, если файл изменился. Содержимое читается, только когда
+    /// изменились время или размер.
+    pub fn check(path: &Path, known: Option<Disk>) -> Change {
+        let Ok(meta) = fs::metadata(path) else {
+            return if known.is_some() {
+                Change::Gone
+            } else {
+                Change::None
+            };
+        };
+        if known.is_some_and(|k| k.modified == meta.modified().ok() && k.len == meta.len()) {
+            return Change::None;
+        }
+        match read(path) {
+            Ok(Some(bytes)) => {
+                let now = Disk::of(&meta, &bytes);
+                if known.is_some_and(|k| k.hash == now.hash) {
+                    Change::Touched(now)
+                } else {
+                    Change::Content(now)
+                }
+            }
+            _ => Change::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    None,
+    /// Изменилось только время.
+    Touched(Disk),
+    Content(Disk),
+    Gone,
 }
 
 /// Проходит по символическим ссылкам, в том числе к ещё не созданному файлу.
@@ -95,12 +183,13 @@ fn can_replace(_: &fs::Metadata) -> bool {
 }
 
 fn replace(target: &Path, bytes: &[u8], old: Option<&fs::Metadata>) -> io::Result<()> {
-    let (mut file, temp) = create_temp(target)?;
+    let (mut file, temp) = create_temp(target, old.is_some())?;
     let result = (|| {
-        file.write_all(bytes)?;
+        // Права ставятся до записи: чужим содержимое не видно ни на миг.
         if let Some(old) = old {
             copy_attributes(&file, old)?;
         }
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&temp, target)
@@ -116,7 +205,7 @@ fn replace(target: &Path, bytes: &[u8], old: Option<&fs::Metadata>) -> io::Resul
     result
 }
 
-fn create_temp(target: &Path) -> io::Result<(File, PathBuf)> {
+fn create_temp(target: &Path, private: bool) -> io::Result<(File, PathBuf)> {
     if target.file_name().is_none() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no file name"));
     }
@@ -127,7 +216,15 @@ fn create_temp(target: &Path) -> io::Result<(File, PathBuf)> {
         // Имя не зависит от исходного: вместе они могли бы превысить предел длины.
         let name = format!(".ruconmd-{}-{nanos}-{attempt}.tmp", std::process::id());
         let temp = target.with_file_name(name);
-        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        match options.open(&temp) {
             Ok(file) => return Ok((file, temp)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
@@ -178,6 +275,35 @@ mod tests {
         write(&path, b"2").unwrap();
         assert_eq!(read(&path).unwrap().unwrap(), b"2");
         assert_eq!(entries(dir.path()), 1);
+    }
+
+    #[test]
+    fn changes_on_disk_are_noticed() {
+        let dir = dir();
+        let path = dir.path().join("a.md");
+        assert_eq!(Disk::check(&path, None), Change::None);
+        fs::write(&path, "one").unwrap();
+        let Change::Content(known) = Disk::check(&path, None) else {
+            panic!("a new file is a change");
+        };
+        assert_eq!(Disk::check(&path, Some(known)), Change::None);
+        fs::write(&path, "another").unwrap();
+        let Change::Content(changed) = Disk::check(&path, Some(known)) else {
+            panic!("content changed");
+        };
+        let later = SystemTime::now() + std::time::Duration::from_secs(5);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert!(matches!(
+            Disk::check(&path, Some(changed)),
+            Change::Touched(_)
+        ));
+        fs::remove_file(&path).unwrap();
+        assert_eq!(Disk::check(&path, Some(changed)), Change::Gone);
     }
 
     #[test]

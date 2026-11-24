@@ -154,10 +154,8 @@ impl App {
             }
             match load(path, None, self.lang) {
                 Ok(loaded) => {
-                    self.path = location.path.clone();
                     self.pane = Pane::default();
-                    self.view.scroll_to_start();
-                    self.set_content(loaded);
+                    self.open_other(path.clone(), loaded);
                 }
                 Err(e) => {
                     self.message = Some(e.to_string());

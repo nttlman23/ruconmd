@@ -16,10 +16,10 @@ use crate::layout;
 use crate::mdline;
 use crate::pane::MARGIN;
 use crate::preview::Item;
+use crate::style::{Mark, Tone};
 
 const BAR: Style = Style::new().add_modifier(Modifier::REVERSED);
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
-const GUTTER: Style = Style::new().fg(Color::DarkGray);
 /// Уже этого номера строк не показываются.
 const MIN_TEXT_WIDTH: u16 = 20;
 /// Совпадения поиска.
@@ -35,6 +35,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
+    let screen = frame.area();
+    frame.buffer_mut().set_style(screen, app.theme.base());
 
     let digits = app.buffer.line_count().to_string().len() as u16;
     let mut gutter = if app.view.settings.line_numbers {
@@ -78,7 +80,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         _ => frame.render_widget(Paragraph::new(footer_text(app)).style(BAR), footer),
     }
     match &app.dialog {
-        Some(Dialog::Menu(menu)) => draw_menu(frame, menu, body),
+        Some(Dialog::Menu(menu)) => draw_menu(frame, menu, body, app.theme.base()),
         _ if app.help => draw_help(frame, app, body),
         _ => {}
     }
@@ -105,6 +107,7 @@ fn header_text(app: &App, width: u16) -> String {
 }
 
 fn draw_text(frame: &mut Frame, app: &mut App, area: TextArea, gutter: u16) {
+    let theme = &app.theme;
     let view = &app.view;
     let tab = view.settings.tab_width;
     let selection = app.buffer.selection().unwrap_or(0..0);
@@ -131,7 +134,12 @@ fn draw_text(frame: &mut Frame, app: &mut App, area: TextArea, gutter: u16) {
             let buf = frame.buffer_mut();
             if index == 0 && gutter > 0 {
                 let number = format!("{:>1$}", line + 1, gutter as usize - 1);
-                buf.set_string(area.x - gutter, y, number, GUTTER);
+                buf.set_string(
+                    area.x - gutter,
+                    y,
+                    number,
+                    theme.style(Mark::tone(Tone::Dim)),
+                );
             }
             let mut end_column = 0;
             let mut cursor_x = None;
@@ -142,7 +150,7 @@ fn draw_text(frame: &mut Frame, app: &mut App, area: TextArea, gutter: u16) {
                     cursor_x = Some(g.column);
                 }
                 end_column = g.column + g.width;
-                let mut style = marks.get(byte).copied().unwrap_or_default().style();
+                let mut style = theme.style(marks.get(byte).copied().unwrap_or_default());
                 if hits.iter().any(|h| h.contains(&byte)) {
                     style = MATCH;
                 }
@@ -224,7 +232,7 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
             None => style,
         };
         for span in &line.spans {
-            let mut style = span.mark.style();
+            let mut style = app.theme.style(span.mark);
             if span.item.is_some() && span.item == selected {
                 style = style.patch(SELECTED);
             }
@@ -233,7 +241,10 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
         }
         if let Some(text) = app.pane.code_text(line) {
             put(&mut x, y, text, &|byte| {
-                found(app.pane.code_mark(line, byte).style(), offset + byte)
+                found(
+                    app.theme.style(app.pane.code_mark(line, byte)),
+                    offset + byte,
+                )
             });
         }
     }
@@ -318,7 +329,7 @@ fn popup(area: Rect, width: usize, rows: usize) -> Rect {
     }
 }
 
-fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
+fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect, base: Style) {
     let title = format!(" {} ", printable(&menu.title));
     let widest = menu.items.iter().map(|(name, _)| name.width()).max();
     let width = widest.unwrap_or(0).max(title.width()) + 4;
@@ -344,7 +355,9 @@ fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
             Line::styled(format!(" {} ", printable(name)), style)
         })
         .collect();
-    let list = Paragraph::new(lines).block(Block::bordered().title(title));
+    let list = Paragraph::new(lines)
+        .style(base)
+        .block(Block::bordered().title(title));
     frame.render_widget(Clear, rect);
     frame.render_widget(list, rect);
 }
@@ -360,7 +373,10 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     let rect = popup(area, 40, rows.len());
     let block = Block::bordered().title(app.lang.strings().help_title);
     frame.render_widget(Clear, rect);
-    frame.render_widget(Paragraph::new(rows).block(block), rect);
+    frame.render_widget(
+        Paragraph::new(rows).style(app.theme.base()).block(block),
+        rect,
+    );
 }
 
 /// Строка для вывода вне области текста: без управляющих символов.
@@ -389,6 +405,9 @@ mod tests {
             lang: Lang::Ru,
             encoding: None,
             line: None,
+            config: crate::config::Config::default(),
+            warnings: Vec::new(),
+            state_dir: None,
         };
         let opener = Box::new(crate::links::System);
         let mut app = App::open(options, Box::<Local>::default(), opener).unwrap();

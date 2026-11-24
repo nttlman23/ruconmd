@@ -3,7 +3,9 @@
 mod find;
 mod markup;
 mod navigate;
+mod protect;
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -13,9 +15,10 @@ use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEven
 use crate::buffer::{Buffer, Eol};
 use crate::clipboard::Clipboard;
 use crate::command::{Command, Mode};
+use crate::config::{Config, Warning};
 use crate::dialog::{Action, Ask, Dialog, Field, Location, Menu, Outcome, SaveJob, Then};
 use crate::encoding::{self, Enc, Format, Unencodable};
-use crate::file::{self, ReadError};
+use crate::file::{self, Disk, ReadError};
 use crate::i18n::Lang;
 use crate::input::Input;
 use crate::key::{Chord, Key};
@@ -23,14 +26,14 @@ use crate::keymap::Keymap;
 use crate::links::Opener;
 use crate::mdline::States;
 use crate::pane::Pane;
+use crate::recovery::{Orphan, Recovery};
 use crate::search::{Query, Search};
-use crate::view::{Place, Settings, Viewport};
+use crate::style::Theme;
+use crate::view::{Place, Viewport};
 
 const WHEEL_LINES: isize = 3;
 /// Время на подсветку кода за одну отрисовку.
 const HIGHLIGHT_BUDGET: Duration = Duration::from_millis(15);
-/// Шире этого текст просмотра не растягивается.
-const PREVIEW_WIDTH: usize = 100;
 
 /// Прямоугольник текста на экране, без номеров строк.
 #[derive(Debug, Clone, Copy, Default)]
@@ -48,6 +51,10 @@ pub struct Options {
     pub encoding: Option<Enc>,
     /// Номер строки с единицы.
     pub line: Option<usize>,
+    pub config: Config,
+    pub warnings: Vec<Warning>,
+    /// Где хранить копии для восстановления. `None`: не хранить.
+    pub state_dir: Option<PathBuf>,
 }
 
 pub struct App {
@@ -59,6 +66,7 @@ pub struct App {
     pub states: States,
     pub mode: Mode,
     pub lang: Lang,
+    pub theme: Theme,
     pub keymap: Keymap,
     pub message: Option<String>,
     pub dialog: Option<Dialog>,
@@ -70,6 +78,20 @@ pub struct App {
     saved_format: Format,
     /// Файл прочитан с потерями, запись в него требует подтверждения.
     lossy: bool,
+    /// Файл, каким программа видела его последний раз. `None`: его не было.
+    disk: Option<Disk>,
+    /// На диске не то, от чего идут правки.
+    disk_differs: bool,
+    next_check: Instant,
+    state_dir: Option<PathBuf>,
+    recovery: Option<Recovery>,
+    recovery_failed: bool,
+    orphan: Option<Orphan>,
+    backup: bool,
+    backed_up: HashSet<PathBuf>,
+    autosave: Option<Duration>,
+    autosave_state: Option<protect::Autosave>,
+    preview_width: usize,
     clipboard: Box<dyn Clipboard>,
     opener: Box<dyn Opener>,
     /// Поиск, совпадения которого подсвечены.
@@ -93,19 +115,21 @@ struct Loaded {
     format: Format,
     lossy: bool,
     large: bool,
+    disk: Option<Disk>,
 }
 
 fn load(path: &Path, forced: Option<Enc>, lang: Lang) -> io::Result<Loaded> {
     let s = lang.strings();
     let fail = |reason: String| io::Error::other(format!("{}: {reason}", path.display()));
-    match file::read(path) {
-        Ok(Some(bytes)) => {
+    match file::read_with_meta(path) {
+        Ok(Some((bytes, meta))) => {
             let decoded = encoding::decode(&bytes, forced);
             Ok(Loaded {
                 text: decoded.text,
                 format: decoded.format,
                 lossy: decoded.lossy,
                 large: bytes.len() > file::LARGE,
+                disk: Some(Disk::of(&meta, &bytes)),
             })
         }
         Ok(None) => Ok(Loaded {
@@ -113,6 +137,7 @@ fn load(path: &Path, forced: Option<Enc>, lang: Lang) -> io::Result<Loaded> {
             format: forced.map_or(Format::UTF8, Format::of),
             lossy: false,
             large: false,
+            disk: None,
         }),
         Err(ReadError::Directory) => Err(fail(s.is_directory.into())),
         Err(ReadError::NotRegular) => Err(fail(s.not_regular.into())),
@@ -134,17 +159,25 @@ impl App {
                 format: options.encoding.map_or(Format::UTF8, Format::of),
                 lossy: false,
                 large: false,
+                disk: None,
             },
         };
+        let config = options.config;
+        let path = options.path;
+        let state_dir = options.state_dir;
+        let recovery = state_dir
+            .clone()
+            .map(|dir| Recovery::new(dir, path.as_deref()));
         let mut app = Self {
-            path: options.path,
+            path,
             buffer: Buffer::new(""),
-            view: Viewport::new(Settings::default()),
+            view: Viewport::new(config.editor),
             pane: Pane::default(),
             states: States::default(),
             mode: options.mode,
             lang,
-            keymap: Keymap::default(),
+            theme: config.theme,
+            keymap: config.keymap,
             message: None,
             dialog: None,
             help: false,
@@ -152,6 +185,18 @@ impl App {
             format: Format::UTF8,
             saved_format: Format::UTF8,
             lossy: false,
+            disk: None,
+            disk_differs: false,
+            next_check: Instant::now(),
+            state_dir,
+            recovery,
+            recovery_failed: false,
+            orphan: None,
+            backup: config.backup,
+            backed_up: HashSet::new(),
+            autosave: config.autosave,
+            autosave_state: None,
+            preview_width: config.preview_width,
             clipboard,
             opener,
             search: None,
@@ -171,18 +216,30 @@ impl App {
         if app.mode == Mode::View {
             app.enter_view();
         }
+        if let Some(first) = options.warnings.first() {
+            let more = options.warnings.len() - 1;
+            app.message = Some(lang.config_warning(first, more));
+        }
+        app.offer_recovery();
         Ok(app)
     }
 
     fn set_content(&mut self, loaded: Loaded) {
-        let s = self.lang.strings();
         self.buffer = Buffer::new(&loaded.text);
-        self.format = loaded.format;
-        self.saved_format = loaded.format;
-        self.lossy = loaded.lossy;
         self.goal = None;
         self.follow = true;
         self.view.clamp(&self.buffer);
+        self.accept_file(&loaded);
+    }
+
+    /// Запоминает, каким прочитан файл.
+    fn accept_file(&mut self, loaded: &Loaded) {
+        let s = self.lang.strings();
+        self.format = loaded.format;
+        self.saved_format = loaded.format;
+        self.lossy = loaded.lossy;
+        self.disk = loaded.disk;
+        self.disk_differs = false;
         if loaded.lossy {
             self.message = Some(s.lossy_warning.into());
         } else if loaded.large {
@@ -191,7 +248,7 @@ impl App {
     }
 
     pub fn is_modified(&self) -> bool {
-        self.buffer.is_modified() || self.format != self.saved_format
+        self.buffer.is_modified() || self.format != self.saved_format || self.disk_differs
     }
 
     /// Строка и колонка курсора с единицы.
@@ -218,7 +275,10 @@ impl App {
 
     /// Вызывается перед отрисовкой просмотра.
     pub fn prepare_preview(&mut self, width: usize, height: usize) {
-        let width = width.min(PREVIEW_WIDTH);
+        let width = match self.preview_width {
+            0 => width,
+            limit => width.min(limit),
+        };
         let tab = self.view.settings.tab_width;
         self.pane.prepare(&self.buffer, width, height, tab);
         self.pane.set_search(self.search.as_ref());
@@ -689,6 +749,7 @@ impl App {
                 then,
                 overwrite: false,
                 allow_lossy: false,
+                ignore_disk: false,
             }),
         }
     }
@@ -701,6 +762,10 @@ impl App {
             Action::SaveThen(then) => self.save(then),
             Action::Discard(then) => self.proceed(then),
             Action::GotoSrc(src) => self.goto_src(src),
+            Action::Restore => self.restore(),
+            Action::DropCopy => self.drop_copy(),
+            Action::TakeDisk => self.take_disk(),
+            Action::SaveAs => self.ask_path(Then::Stay),
             Action::Reload(_) if self.is_modified() => {
                 self.message = Some(s.save_first.into());
             }
@@ -740,6 +805,7 @@ impl App {
                 then,
                 overwrite: true,
                 allow_lossy: false,
+                ignore_disk: false,
             }),
             None => self.ask_path(then),
         }
@@ -771,6 +837,9 @@ impl App {
             ];
             return self.menu(s.ask_lossy, items);
         }
+        if same && !job.ignore_disk && self.ask_about_disk(&job) {
+            return;
+        }
         let bytes = match encoding::encode(&self.buffer.text(), job.format) {
             Ok(bytes) => bytes,
             Err(Unencodable(c)) => {
@@ -787,10 +856,15 @@ impl App {
                 return self.menu(&title, items);
             }
         };
+        let backup = self.back_up(&job.path, &bytes);
         match file::write(&job.path, &bytes) {
             Ok(()) => {
-                self.message = Some(format!("{}: {}", s.saved, job.path.display()));
-                self.path = Some(job.path);
+                let mut message = format!("{}: {}", s.saved, job.path.display());
+                if let Err(e) = backup {
+                    message = format!("{message} ({}: {e})", s.no_backup);
+                }
+                self.message = Some(message);
+                self.after_write(&job.path, &bytes);
                 self.format = job.format;
                 self.saved_format = job.format;
                 self.lossy = false;
@@ -832,6 +906,9 @@ mod tests {
             lang: Lang::En,
             encoding,
             line: None,
+            config: Config::default(),
+            warnings: Vec::new(),
+            state_dir: None,
         };
         let mut app =
             App::open(options, Box::<Local>::default(), Box::<Opened>::default()).unwrap();
@@ -1614,6 +1691,349 @@ mod tests {
         assert!(app.dialog.is_none() && app.message.is_some());
     }
 
+    // --- Защита данных ---
+
+    struct Session {
+        dir: tempfile::TempDir,
+        path: PathBuf,
+        now: Instant,
+        config: Config,
+    }
+
+    impl Session {
+        fn new(text: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.md");
+            fs::write(&path, text).unwrap();
+            Self {
+                dir,
+                path,
+                now: Instant::now(),
+                config: Config::default(),
+            }
+        }
+
+        fn open(&self) -> App {
+            let options = Options {
+                path: Some(self.path.clone()),
+                mode: Mode::Edit,
+                lang: Lang::En,
+                encoding: None,
+                line: None,
+                config: self.config.clone(),
+                warnings: Vec::new(),
+                state_dir: Some(self.state()),
+            };
+            let mut app =
+                App::open(options, Box::<Local>::default(), Box::<Opened>::default()).unwrap();
+            draw(&mut app);
+            app
+        }
+
+        fn state(&self) -> PathBuf {
+            self.dir.path().join("state")
+        }
+
+        fn copies(&self) -> usize {
+            fs::read_dir(self.state()).map_or(0, Iterator::count)
+        }
+
+        /// Проходит столько секунд, по одной.
+        fn pass(&mut self, app: &mut App, seconds: u64) {
+            for _ in 0..seconds {
+                self.now += Duration::from_secs(1);
+                app.tick(self.now);
+                draw(app);
+            }
+        }
+
+        fn disk(&self) -> String {
+            fs::read_to_string(&self.path).unwrap()
+        }
+    }
+
+    #[test]
+    fn lost_session_is_restored() {
+        let mut s = Session::new("старое\n");
+        let mut app = s.open();
+        type_in(&mut app, "правка ");
+        s.pass(&mut app, 8);
+        // Фоновая запись могла ещё не закончиться.
+        app.emergency_save().unwrap();
+        drop(app);
+
+        let mut app = s.open();
+        assert!(menu_title(&app).contains("Unsaved changes found"));
+        assert!(!menu_title(&app).contains("changed since"));
+        press(&mut app, "enter");
+        assert_eq!(app.buffer.text(), "правка старое\n");
+        assert!(app.is_modified());
+        assert_eq!(s.disk(), "старое\n", "restoring does not write the file");
+        assert_eq!(s.copies(), 2, "own copy and lock, the old ones are gone");
+        press(&mut app, "ctrl+z");
+        assert_eq!(app.buffer.text(), "старое\n");
+        press(&mut app, "ctrl+y ctrl+s");
+        s.pass(&mut app, 1);
+        assert_eq!(s.disk(), "правка старое\n");
+        assert_eq!(s.copies(), 0);
+        app.finish();
+        assert!(s.open().dialog.is_none());
+    }
+
+    #[test]
+    fn postponed_and_dropped_copies() {
+        let s = Session::new("старое\n");
+        let mut app = s.open();
+        type_in(&mut app, "x");
+        app.emergency_save().unwrap();
+        drop(app);
+        fs::write(&s.path, "чужое\n").unwrap();
+        let mut app = s.open();
+        assert!(menu_title(&app).contains("changed since"));
+        press(&mut app, "down enter");
+        assert_eq!(app.buffer.text(), "чужое\n");
+        app.finish();
+        drop(app);
+        let mut app = s.open();
+        assert!(app.dialog.is_some(), "offered again");
+        press(&mut app, "down down enter");
+        assert_eq!(s.copies(), 0);
+        assert_eq!(app.buffer.text(), "чужое\n");
+    }
+
+    #[test]
+    fn restored_text_keeps_encoding_and_line_ends() {
+        let s = Session::new("");
+        let cp866 = Format::of(Enc::Cp866);
+        fs::write(
+            &s.path,
+            encoding::encode("Обычный текст\r\nзаметки\r\n", cp866).unwrap(),
+        )
+        .unwrap();
+        let mut app = s.open();
+        type_in(&mut app, "Ж");
+        app.emergency_save().unwrap();
+        drop(app);
+        let mut app = s.open();
+        press(&mut app, "enter ctrl+s");
+        let want = encoding::encode("ЖОбычный текст\r\nзаметки\r\n", cp866).unwrap();
+        assert_eq!(fs::read(&s.path).unwrap(), want);
+    }
+
+    #[test]
+    fn two_windows_do_not_steal_each_others_copies() {
+        let mut s = Session::new("текст\n");
+        let mut first = s.open();
+        type_in(&mut first, "x");
+        first.emergency_save().unwrap();
+        let mut second = s.open();
+        assert!(second.dialog.is_none());
+        assert!(
+            second
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("Another window")
+        );
+        second.finish();
+        assert_eq!(s.copies(), 2, "the copy of the first window is intact");
+        press(&mut first, "ctrl+z");
+        s.pass(&mut first, 1);
+        assert_eq!(s.copies(), 0);
+    }
+
+    #[test]
+    fn foreign_change_is_reported_and_can_be_taken() {
+        let mut s = Session::new("а\nб\nв\n");
+        let mut app = s.open();
+        press(&mut app, "down");
+        type_in(&mut app, "моё ");
+        fs::write(&s.path, "чужое\nб\r\nв\n").unwrap();
+        s.pass(&mut app, 3);
+        assert!(menu_title(&app).contains("another program"));
+        press(&mut app, "down enter");
+        assert_eq!(app.buffer.text(), "чужое\nб\r\nв\n");
+        assert!(!app.is_modified());
+        assert_eq!(app.cursor_line_column().0, 2);
+        press(&mut app, "ctrl+z");
+        assert_eq!(app.buffer.text(), "а\nмоё б\nв\n", "reload can be undone");
+        s.pass(&mut app, 5);
+        assert!(app.dialog.is_none());
+    }
+
+    #[test]
+    fn foreign_change_is_not_overwritten_silently() {
+        let mut s = Session::new("а\n");
+        let mut app = s.open();
+        type_in(&mut app, "моё ");
+        fs::write(&s.path, "чужое, длиннее\n").unwrap();
+        press(&mut app, "ctrl+s");
+        assert!(menu_title(&app).contains("another program"));
+        press(&mut app, "enter");
+        assert_eq!(s.disk(), "чужое, длиннее\n", "cancel is the default");
+        s.pass(&mut app, 3);
+        press(&mut app, "esc");
+        assert!(app.is_modified(), "own version is kept as unsaved");
+        s.pass(&mut app, 5);
+        assert!(app.dialog.is_none(), "asked once");
+        press(&mut app, "ctrl+s");
+        assert_eq!(s.disk(), "моё а\n");
+        let backup = s.dir.path().join("a.md.bak");
+        assert_eq!(fs::read_to_string(backup).unwrap(), "чужое, длиннее\n");
+    }
+
+    #[test]
+    fn own_saves_touching_and_deleting() {
+        let mut s = Session::new("а\n");
+        let mut app = s.open();
+        for _ in 0..3 {
+            type_in(&mut app, "x");
+            press(&mut app, "ctrl+s");
+            s.pass(&mut app, 3);
+            assert!(app.dialog.is_none(), "own save is not a foreign change");
+        }
+        fs::write(&s.path, s.disk()).unwrap();
+        s.pass(&mut app, 3);
+        assert!(app.dialog.is_none(), "same content is not a change");
+        fs::remove_file(&s.path).unwrap();
+        s.pass(&mut app, 3);
+        assert!(app.is_modified() && app.message.as_deref().unwrap().contains("deleted"));
+        press(&mut app, "ctrl+s");
+        assert_eq!(s.disk(), "xxxа\n");
+    }
+
+    #[test]
+    fn backup_is_made_once_per_session() {
+        let mut s = Session::new("первое");
+        let backup = s.dir.path().join("a.md.bak");
+        let mut app = s.open();
+        press(&mut app, "ctrl+s");
+        assert!(!backup.exists(), "nothing changed, nothing to back up");
+        type_in(&mut app, "1");
+        press(&mut app, "ctrl+s");
+        type_in(&mut app, "2");
+        press(&mut app, "ctrl+s");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "первое");
+        app.finish();
+        let mut app = s.open();
+        type_in(&mut app, "3");
+        press(&mut app, "ctrl+s");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "12первое");
+        fs::remove_file(&backup).unwrap();
+        s.config.backup = false;
+        let mut app = s.open();
+        type_in(&mut app, "4");
+        press(&mut app, "ctrl+s");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn failed_backup_is_reported_but_text_is_saved() {
+        let s = Session::new("а");
+        fs::create_dir(s.dir.path().join("a.md.bak")).unwrap();
+        let mut app = s.open();
+        type_in(&mut app, "x");
+        press(&mut app, "ctrl+s");
+        assert_eq!(s.disk(), "xа");
+        assert!(app.message.as_deref().unwrap().contains("no .bak copy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_is_private_and_does_not_follow_links() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let s = Session::new("тайна");
+        fs::set_permissions(&s.path, fs::Permissions::from_mode(0o600)).unwrap();
+        let (backup, victim) = (s.dir.path().join("a.md.bak"), s.dir.path().join("victim"));
+        fs::write(&victim, "не трогать").unwrap();
+        symlink(&victim, &backup).unwrap();
+        let mut app = s.open();
+        type_in(&mut app, "x");
+        press(&mut app, "ctrl+s");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "не трогать");
+        let meta = fs::symlink_metadata(&backup).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn autosave_waits_for_a_pause() {
+        let mut s = Session::new("а");
+        s.config.autosave = Some(Duration::from_secs(3));
+        let mut app = s.open();
+        type_in(&mut app, "1");
+        s.pass(&mut app, 3);
+        type_in(&mut app, "2");
+        s.pass(&mut app, 3);
+        assert_eq!(s.disk(), "а");
+        s.pass(&mut app, 2);
+        assert_eq!(s.disk(), "12а");
+        assert!(!app.is_modified() && app.message.is_none());
+        press(&mut app, "ctrl+z");
+        assert_eq!(app.buffer.text(), "а", "undo works after autosave");
+    }
+
+    #[test]
+    fn autosave_stops_on_conflict_and_bad_encoding() {
+        let mut s = Session::new("а");
+        s.config.autosave = Some(Duration::from_secs(3));
+        let mut app = s.open();
+        type_in(&mut app, "x");
+        fs::write(&s.path, "чужое, длиннее").unwrap();
+        s.pass(&mut app, 4);
+        press(&mut app, "esc");
+        s.pass(&mut app, 10);
+        assert_eq!(s.disk(), "чужое, длиннее");
+        press(&mut app, "ctrl+s");
+        assert_eq!(s.disk(), "xа");
+
+        app.act(Action::SetFormat(Format::of(Enc::Cp866)));
+        type_in(&mut app, "😀");
+        s.pass(&mut app, 6);
+        assert!(app.dialog.is_none() && app.is_modified());
+        assert!(app.message.as_deref().unwrap().contains("Autosave"));
+        assert_eq!(s.disk(), "xа");
+    }
+
+    #[test]
+    fn unnamed_text_is_restored_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = || {
+            let options = Options {
+                path: None,
+                mode: Mode::Edit,
+                lang: Lang::En,
+                encoding: None,
+                line: None,
+                config: Config::default(),
+                warnings: Vec::new(),
+                state_dir: Some(dir.path().into()),
+            };
+            App::open(options, Box::<Local>::default(), Box::<Opened>::default()).unwrap()
+        };
+        let mut app = start();
+        type_in(&mut app, "x");
+        app.emergency_save().unwrap();
+        drop(app);
+        let mut app = start();
+        press(&mut app, "enter");
+        assert_eq!(app.buffer.text(), "x");
+    }
+
+    #[test]
+    fn config_is_applied() {
+        let mut s = Session::new("a\tb");
+        let text = "theme = \"light\"\n[editor]\ntab_width = 8\n[keys]\ntoggle_mode = [\"f9\"]\n";
+        s.config = crate::config::parse(text).0;
+        let mut app = s.open();
+        assert_eq!(app.view.settings.tab_width, 8);
+        assert_eq!(app.theme, Theme::LIGHT);
+        press(&mut app, "f5");
+        assert_eq!(app.mode, Mode::Edit);
+        press(&mut app, "f9");
+        assert_eq!(app.mode, Mode::View);
+    }
+
     #[test]
     fn directory_is_an_error() {
         let options = Options {
@@ -1622,6 +2042,9 @@ mod tests {
             lang: Lang::En,
             encoding: None,
             line: None,
+            config: Config::default(),
+            warnings: Vec::new(),
+            state_dir: None,
         };
         assert!(App::open(options, Box::<Local>::default(), Box::<Opened>::default()).is_err());
     }
