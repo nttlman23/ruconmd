@@ -30,3 +30,17 @@ jobs:
         if: failure()
         shell: bash
         run: if [ -f test.log ]; then python .github/scripts/report_failures.py test.log; fi
+      # Для ручной проверки, это не выпуск.
+      - name: Build exe
+        if: runner.os == 'Windows' && github.event_name == 'push'
+        shell: bash
+        run: |
+          cargo build --locked --release
+          ./target/release/ruconmd.exe --version
+      - uses: actions/upload-artifact@v6
+        if: runner.os == 'Windows' && github.event_name == 'push'
+        with:
+          name: ruconmd-windows-x86_64
+          path: target/release/ruconmd.exe
+          if-no-files-found: error
+          retention-days: 14
