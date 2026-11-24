@@ -13,12 +13,16 @@ use crate::buffer::Eol;
 use crate::command::{Command, Mode};
 use crate::dialog::{Dialog, Field, Menu};
 use crate::layout;
+use crate::mdline;
+use crate::style::Mark;
 
 const BAR: Style = Style::new().add_modifier(Modifier::REVERSED);
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 const GUTTER: Style = Style::new().fg(Color::DarkGray);
 /// Уже этого номера строк не показываются.
 const MIN_TEXT_WIDTH: u16 = 20;
+/// Поле слева от просмотра.
+const MARGIN: u16 = 1;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [header, body, footer] = Layout::vertical([
@@ -44,13 +48,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         height: body.height,
     };
     app.prepare(area);
+    if app.mode == Mode::View {
+        app.prepare_preview(
+            body.width.saturating_sub(MARGIN) as usize,
+            body.height as usize,
+        );
+    }
 
     frame.render_widget(
         Paragraph::new(header_text(app, header.width)).style(BAR),
         header,
     );
-    if area.width > 0 && area.height > 0 {
-        draw_text(frame, app, area, gutter);
+    if body.width > 0 && body.height > 0 {
+        match app.mode {
+            Mode::Edit => draw_text(frame, app, area, gutter),
+            Mode::View => draw_preview(frame, app, body),
+        }
     }
     match &app.dialog {
         Some(Dialog::Field(field)) => draw_field(frame, field, footer),
@@ -83,11 +96,10 @@ fn header_text(app: &App, width: u16) -> String {
     format!("{mark}…{tail}")
 }
 
-fn draw_text(frame: &mut Frame, app: &App, area: TextArea, gutter: u16) {
+fn draw_text(frame: &mut Frame, app: &mut App, area: TextArea, gutter: u16) {
     let view = &app.view;
     let tab = view.settings.tab_width;
-    let edit = app.mode == Mode::Edit;
-    let selection = app.buffer.selection().filter(|_| edit).unwrap_or(0..0);
+    let selection = app.buffer.selection().unwrap_or(0..0);
     let cursor = app.buffer.cursor();
 
     let mut y = area.y;
@@ -97,6 +109,7 @@ fn draw_text(frame: &mut Frame, app: &App, area: TextArea, gutter: u16) {
     while y < bottom && line < app.buffer.line_count() {
         let laid = view.lay_out(&app.buffer, line);
         let start = app.buffer.line_start(line);
+        let marks = mdline::marks(app.states.at(&app.buffer, line), &laid.text);
         for (index, row) in laid.rows.iter().enumerate().skip(first) {
             if y >= bottom {
                 break;
@@ -108,17 +121,18 @@ fn draw_text(frame: &mut Frame, app: &App, area: TextArea, gutter: u16) {
             }
             let mut end_column = 0;
             let mut cursor_x = None;
+            let mut byte = row.byte_start;
             for g in layout::glyphs(&laid.text, *row, tab) {
                 let pos = start + g.offset;
                 if pos == cursor {
                     cursor_x = Some(g.column);
                 }
                 end_column = g.column + g.width;
-                let style = if selection.contains(&pos) {
-                    SELECTED
-                } else {
-                    Style::new()
-                };
+                let mut style = marks.get(byte).copied().unwrap_or_default().style();
+                byte += g.text.len();
+                if selection.contains(&pos) {
+                    style = style.patch(SELECTED);
+                }
                 if g.column < view.left {
                     continue;
                 }
@@ -146,7 +160,6 @@ fn draw_text(frame: &mut Frame, app: &App, area: TextArea, gutter: u16) {
                 }
             }
             if let Some(column) = cursor_x
-                && edit
                 && app.dialog.is_none()
                 && !app.help
                 && column >= view.left
@@ -161,18 +174,60 @@ fn draw_text(frame: &mut Frame, app: &App, area: TextArea, gutter: u16) {
     }
 }
 
+fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
+    let tab = app.view.settings.tab_width;
+    let right = area.x + area.width;
+    let buf = frame.buffer_mut();
+    let mut put = |x: &mut u16, y: u16, text: &str, mark: &dyn Fn(usize) -> Mark| {
+        let row = layout::rows(text, None, tab)[0];
+        let mut byte = 0;
+        for g in layout::glyphs(text, row, tab) {
+            let style = mark(byte).style();
+            byte += g.text.len();
+            if *x as usize + g.width > right as usize {
+                *x = right;
+                return;
+            }
+            buf[(*x, y)].set_symbol(g.symbol()).set_style(style);
+            for extra in 1..g.width as u16 {
+                buf[(*x + extra, y)].set_symbol(" ").set_style(style);
+            }
+            *x += g.width as u16;
+        }
+    };
+    for (line, y) in app.pane.visible().iter().zip(area.y..area.y + area.height) {
+        let mut x = area.x + MARGIN;
+        for span in &line.spans {
+            put(&mut x, y, &span.text, &|_| span.mark);
+        }
+        if let Some(text) = app.pane.code_text(line) {
+            put(&mut x, y, text, &|byte| app.pane.code_mark(line, byte));
+        }
+    }
+}
+
 fn footer_text(app: &App) -> String {
     let mode = app.lang.mode(app.mode);
     if let Some(message) = &app.message {
         return format!(" {mode} | {}", printable(message));
     }
     let s = app.lang.strings();
+    if app.mode == Mode::View && !app.pane.is_ready() {
+        return format!(" {mode} | {}", s.preparing);
+    }
     let place = match app.mode {
         Mode::Edit => {
             let (line, column) = app.cursor_line_column();
             format!("{line}:{column}")
         }
-        Mode::View => format!("{}/{}", app.view.top.line + 1, app.buffer.line_count()),
+        Mode::View => {
+            let pos = app.buffer.pos_of_byte(app.pane.source_at_top());
+            format!(
+                "{}/{}",
+                app.buffer.line_of(pos) + 1,
+                app.buffer.line_count()
+            )
+        }
     };
     let eol = match (app.buffer.ends.mixed, app.buffer.ends.eol) {
         (true, _) => "LF+CRLF",
@@ -358,6 +413,31 @@ mod tests {
     }
 
     #[test]
+    fn preview_shows_rendered_markdown() {
+        let mut app = app("# Привет\n\n- [x] **дело**\n\n```rust\nlet x = 1;\n```\n");
+        press(&mut app, "f5");
+        let t = terminal(&mut app, 40, 12);
+        let buffer = t.backend().buffer();
+        let row = |y: u16| (0..40).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        assert!(row(1).starts_with(" Привет"));
+        assert!(row(4).starts_with(" ☑ дело"));
+        assert!(buffer[(3, 4)].modifier.contains(Modifier::BOLD));
+        assert!(row(7).starts_with(" │ let x = 1;"));
+        assert_eq!(buffer[(3, 7)].fg, Color::Magenta);
+        assert_eq!(buffer[(11, 7)].fg, Color::Yellow);
+    }
+
+    #[test]
+    fn editor_highlights_markup() {
+        let mut app = app("# Глава\nтекст `код`\n");
+        let t = terminal(&mut app, 40, 5);
+        let buffer = t.backend().buffer();
+        assert_eq!(buffer[(2, 1)].fg, Color::Cyan);
+        assert_eq!(buffer[(2, 2)].fg, Color::Reset);
+        assert_eq!(buffer[(9, 2)].fg, Color::Green);
+    }
+
+    #[test]
     fn survives_any_window_size() {
         let mut app = app("текст 日本語 e\u{301}\tконец\n\n");
         for (w, h) in (1..30).flat_map(|w| (1..6).map(move |h| (w, h))) {
@@ -375,6 +455,9 @@ mod tests {
             app.help = false;
             press(&mut app, "ctrl+end");
             screen(&mut app, w, h);
+            press(&mut app, "f5");
+            screen(&mut app, w, h);
+            press(&mut app, "f5");
             press(&mut app, "ctrl+home");
         }
     }

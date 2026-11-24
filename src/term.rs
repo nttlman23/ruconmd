@@ -128,7 +128,13 @@ impl EventReader {
     }
 
     /// Ждёт событие и забирает всё, что уже пришло следом.
-    pub fn read(&mut self) -> io::Result<Batch> {
+    /// `None`: за `timeout` ничего не пришло.
+    pub fn read(&mut self, timeout: Option<Duration>) -> io::Result<Option<Batch>> {
+        if let Some(timeout) = timeout
+            && !event::poll(timeout)?
+        {
+            return Ok(None);
+        }
         let mut raw = vec![event::read()?];
         let mut typed = 0;
         while raw.len() < MAX_BATCH {
@@ -149,6 +155,6 @@ impl EventReader {
             raw.push(event::read()?);
         }
         let inputs = self.decoder.decode(&raw, Instant::now());
-        Ok(Batch { raw, inputs })
+        Ok(Some(Batch { raw, inputs }))
     }
 }

@@ -2,6 +2,7 @@
 
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 
@@ -11,7 +12,10 @@ use crate::command::Mode;
 use crate::encoding::Enc;
 use crate::i18n::Lang;
 use crate::term::{EventReader, Terminal};
-use crate::{diag, ui};
+use crate::{code, diag, ui};
+
+/// Как часто обновлять экран, пока идёт фоновая работа.
+const BUSY_REDRAW: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -53,12 +57,16 @@ pub fn run() -> io::Result<()> {
         line: args.line,
     };
     let mut app = App::open(options, Box::<clipboard::System>::default())?;
+    std::thread::spawn(code::warm_up);
     let mut terminal = Terminal::enter(true)?;
     let mut reader = EventReader::new();
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
-        for input in reader.read()?.inputs {
-            app.handle(input);
+        let timeout = app.is_busy().then_some(BUSY_REDRAW);
+        if let Some(batch) = reader.read(timeout)? {
+            for input in batch.inputs {
+                app.handle(input);
+            }
         }
     }
     Ok(())

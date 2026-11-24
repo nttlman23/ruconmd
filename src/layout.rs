@@ -130,6 +130,15 @@ pub fn glyphs(line: &str, row: Row, tab: usize) -> impl Iterator<Item = Glyph<'_
         })
 }
 
+/// Ширина строки без переноса.
+pub fn width(line: &str, tab: usize) -> usize {
+    let mut column = 0;
+    for g in line.graphemes(true) {
+        column += width_at(g, column, tab);
+    }
+    column
+}
+
 /// Номер экранной строки, в которой стоит курсор со смещением `offset`.
 pub fn row_of(rows: &[Row], offset: usize) -> usize {
     rows.partition_point(|r| r.start <= offset)

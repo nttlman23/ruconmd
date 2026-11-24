@@ -2,6 +2,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -15,9 +16,15 @@ use crate::i18n::Lang;
 use crate::input::Input;
 use crate::key::{Chord, Key};
 use crate::keymap::Keymap;
+use crate::mdline::States;
+use crate::pane::Pane;
 use crate::view::{Place, Settings, Viewport};
 
 const WHEEL_LINES: isize = 3;
+/// Время на подсветку кода за одну отрисовку.
+const HIGHLIGHT_BUDGET: Duration = Duration::from_millis(15);
+/// Шире этого текст просмотра не растягивается.
+const PREVIEW_WIDTH: usize = 100;
 
 /// Прямоугольник текста на экране, без номеров строк.
 #[derive(Debug, Clone, Copy, Default)]
@@ -41,6 +48,9 @@ pub struct App {
     pub path: Option<PathBuf>,
     pub buffer: Buffer,
     pub view: Viewport,
+    pub pane: Pane,
+    /// Состояния строк для подсветки разметки.
+    pub states: States,
     pub mode: Mode,
     pub lang: Lang,
     pub keymap: Keymap,
@@ -61,8 +71,6 @@ pub struct App {
     /// Показать курсор при следующей отрисовке.
     follow: bool,
     dragging: bool,
-    /// Прокрутка при уходе в просмотр: вернулись на неё же, курсор не трогаем.
-    left_at: Place,
 }
 
 struct Loaded {
@@ -113,6 +121,8 @@ impl App {
             path: options.path,
             buffer: Buffer::new(""),
             view: Viewport::new(Settings::default()),
+            pane: Pane::default(),
+            states: States::default(),
             mode: options.mode,
             lang,
             keymap: Keymap::default(),
@@ -128,11 +138,13 @@ impl App {
             goal: None,
             follow: true,
             dragging: false,
-            left_at: Place::default(),
         };
         app.set_content(loaded);
         if let Some(line) = options.line {
             app.goto_line(line);
+        }
+        if app.mode == Mode::View {
+            app.enter_view();
         }
         Ok(app)
     }
@@ -168,12 +180,28 @@ impl App {
     pub fn prepare(&mut self, area: TextArea) {
         self.area = area;
         let (width, height) = (area.width as usize, area.height as usize);
+        if let Some(line) = self.buffer.take_changed_line() {
+            self.states.invalidate(line);
+        }
         self.view.resize(&self.buffer, width, height);
         if self.follow && self.mode == Mode::Edit {
             self.view.reveal(&self.buffer, self.buffer.cursor());
         } else {
             self.view.clamp(&self.buffer);
         }
+    }
+
+    /// Вызывается перед отрисовкой просмотра.
+    pub fn prepare_preview(&mut self, width: usize, height: usize) {
+        let width = width.min(PREVIEW_WIDTH);
+        let tab = self.view.settings.tab_width;
+        self.pane.prepare(&self.buffer, width, height, tab);
+        self.pane.highlight(Instant::now() + HIGHLIGHT_BUDGET);
+    }
+
+    /// Нужна отрисовка, даже если пользователь ничего не нажимает.
+    pub fn is_busy(&self) -> bool {
+        self.mode == Mode::View && self.pane.is_busy()
     }
 
     // --- Ввод ---
@@ -222,12 +250,12 @@ impl App {
     fn view_key(&mut self, chord: Chord) {
         let page = self.page();
         match chord.key {
-            Key::Up => self.view.scroll(&self.buffer, -1),
-            Key::Down => self.view.scroll(&self.buffer, 1),
-            Key::PageUp => self.view.scroll(&self.buffer, -page),
-            Key::PageDown => self.view.scroll(&self.buffer, page),
-            Key::Home => self.view.scroll_to_start(),
-            Key::End => self.view.scroll_to_end(&self.buffer),
+            Key::Up => self.pane.scroll(-1),
+            Key::Down => self.pane.scroll(1),
+            Key::PageUp => self.pane.scroll(-page),
+            Key::PageDown => self.pane.scroll(page),
+            Key::Home => self.pane.scroll_to_start(),
+            Key::End => self.pane.scroll_to_end(),
             _ => {}
         }
     }
@@ -334,9 +362,15 @@ impl App {
     }
 
     fn wheel(&mut self, delta: isize) {
-        if self.dialog.is_none() && !self.help {
-            self.view.scroll(&self.buffer, delta);
-            self.follow = false;
+        if self.dialog.is_some() || self.help {
+            return;
+        }
+        match self.mode {
+            Mode::View => self.pane.scroll(delta),
+            Mode::Edit => {
+                self.view.scroll(&self.buffer, delta);
+                self.follow = false;
+            }
         }
     }
 
@@ -404,8 +438,9 @@ impl App {
         self.view.top = Place { line, row: 0 };
         let back = self.view.height as isize / 2;
         self.view.scroll(&self.buffer, -back);
-        // Чтобы возврат из просмотра не счёл это прокруткой.
-        self.left_at = self.view.top;
+        if self.mode == Mode::View {
+            self.enter_view();
+        }
     }
 
     // --- Команды ---
@@ -475,17 +510,35 @@ impl App {
     fn toggle_mode(&mut self) {
         self.mode = self.mode.toggled();
         match self.mode {
-            Mode::View => self.left_at = self.view.top,
-            Mode::Edit => {
-                let scrolled = self.view.top != self.left_at;
-                let cursor = self.buffer.cursor();
-                // После прокрутки курсор встаёт туда, куда смотрит пользователь.
-                if scrolled && !self.view.is_visible(&self.buffer, cursor) {
-                    let pos = self.view.position(&self.buffer, self.view.top, 0);
-                    self.move_to(pos, false);
-                }
-                self.follow = false;
-            }
+            Mode::View => self.enter_view(),
+            Mode::Edit => self.leave_view(),
+        }
+    }
+
+    /// Просмотр открывается на том же блоке и на той же высоте экрана.
+    fn enter_view(&mut self) {
+        let cursor = self.buffer.cursor();
+        let (pos, row) = if self.view.is_visible(&self.buffer, cursor) {
+            let (place, _) = self.view.locate(&self.buffer, cursor);
+            (cursor, self.view.rows_between(&self.buffer, place))
+        } else {
+            (self.view.position(&self.buffer, self.view.top, 0), 0)
+        };
+        self.pane.show(self.buffer.byte_of(pos), row);
+    }
+
+    /// Без прокрутки всё остаётся как было, после неё редактор следует за просмотром.
+    fn leave_view(&mut self) {
+        self.follow = false;
+        if !self.pane.is_scrolled() {
+            return;
+        }
+        let pos = self.buffer.pos_of_byte(self.pane.source_at_top());
+        self.view.top = self.view.locate(&self.buffer, pos).0;
+        self.view.clamp(&self.buffer);
+        if !self.view.is_visible(&self.buffer, self.buffer.cursor()) {
+            self.move_to(pos, false);
+            self.follow = false;
         }
     }
 
@@ -704,6 +757,9 @@ mod tests {
             width: 41,
             height: 10,
         });
+        if app.mode == Mode::View {
+            app.prepare_preview(44, 10);
+        }
     }
 
     fn press(app: &mut App, chords: &str) {
@@ -1010,14 +1066,46 @@ mod tests {
 
     #[test]
     fn mode_toggle_keeps_position_and_cursor() {
-        let mut app = with_text(&"x\n".repeat(100));
+        let mut app = with_text(&"x\n\n".repeat(100));
         press(&mut app, "pagedown pagedown");
         let (top, cursor) = (app.view.top, app.buffer.cursor());
         press(&mut app, "f5 ctrl+у");
         assert_eq!((app.view.top, app.buffer.cursor()), (top, cursor));
+    }
+
+    #[test]
+    fn scrolled_preview_moves_the_editor() {
+        let text: String = (0..100).map(|i| format!("## Глава {i}\n\n")).collect();
+        let mut app = with_text(&text);
         press(&mut app, "f5 end f5");
-        assert_eq!(app.view.top.line, 91);
-        assert_eq!(app.cursor_line_column().0, 92);
+        let (line, _) = app.cursor_line_column();
+        assert!(line > 190, "{line}");
+        assert!(app.view.is_visible(&app.buffer, app.buffer.cursor()));
+    }
+
+    #[test]
+    fn preview_opens_at_the_cursor_row() {
+        let text: String = (0..100).map(|i| format!("абзац {i}\n\n")).collect();
+        let mut app = with_text(&text);
+        press(&mut app, "ctrl+g");
+        type_in(&mut app, "101\n");
+        let (place, _) = app.view.locate(&app.buffer, app.buffer.cursor());
+        let row = app.view.rows_between(&app.buffer, place);
+        press(&mut app, "f5");
+        let line = &app.pane.visible()[row];
+        assert_eq!(line.spans[0].text, "абзац 50");
+        press(&mut app, "f5");
+        assert_eq!(app.cursor_line_column().0, 101);
+    }
+
+    #[test]
+    fn goto_line_works_in_preview() {
+        let text: String = (0..100).map(|i| format!("абзац {i}\n\n")).collect();
+        let mut app = with_text(&text);
+        press(&mut app, "f5 ctrl+g");
+        type_in(&mut app, "101\n");
+        let shown = app.pane.visible().iter().flat_map(|l| &l.spans);
+        assert!(shown.into_iter().any(|s| s.text == "абзац 50"));
     }
 
     #[test]

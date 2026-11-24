@@ -41,7 +41,9 @@ pub fn run(lang: Lang) -> io::Result<()> {
                 let block = Block::bordered().title(s.diag_title);
                 frame.render_widget(Paragraph::new(lines).block(block), body);
             })?;
-            let batch = reader.read()?;
+            let Some(batch) = reader.read(None)? else {
+                continue;
+            };
             log.extend(batch.raw.iter().filter_map(describe_raw));
             for input in &batch.inputs {
                 if *input == Input::Key(Chord::plain(Key::Esc)) {

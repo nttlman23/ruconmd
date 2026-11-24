@@ -230,6 +230,18 @@ impl Viewport {
         }
     }
 
+    /// Сколько экранных строк от верха до места, не больше высоты экрана.
+    pub fn rows_between(&self, buffer: &Buffer, place: Place) -> usize {
+        let mut at = self.top;
+        for rows in 0..self.height {
+            if at >= place {
+                return rows;
+            }
+            at = self.advance(buffer, at, 1);
+        }
+        self.height
+    }
+
     pub fn is_visible(&self, buffer: &Buffer, pos: usize) -> bool {
         let (place, _) = self.locate(buffer, pos);
         let last = self.advance(buffer, self.top, self.height.saturating_sub(1) as isize);

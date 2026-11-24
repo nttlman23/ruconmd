@@ -1,0 +1,592 @@
+//! Построение просмотра: Markdown в строки экрана заданной ширины.
+
+mod inline;
+mod table;
+
+use std::ops::Range;
+
+use pulldown_cmark::{
+    BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
+
+use crate::layout;
+use crate::style::{Mark, Tone};
+use inline::Inline;
+use table::Table;
+
+/// Меньше этого содержимое не сужается, лишнее обрезается краем экрана.
+const MIN_CONTENT: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    pub text: String,
+    pub mark: Mark,
+    /// Номер в [`Doc::links`].
+    pub link: Option<u32>,
+}
+
+impl Span {
+    fn new(text: impl Into<String>, mark: Mark) -> Self {
+        Self {
+            text: text.into(),
+            mark,
+            link: None,
+        }
+    }
+}
+
+/// Часть строки кода. Подсветка добавляется при отрисовке.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeRef {
+    pub block: u32,
+    pub line: u32,
+    pub bytes: Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Line {
+    pub spans: Vec<Span>,
+    pub code: Option<CodeRef>,
+    /// Байт исходного текста, которому соответствует начало строки.
+    pub src: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct CodeBlock {
+    pub lang: String,
+    pub lines: Vec<String>,
+}
+
+/// Готовый просмотр.
+#[derive(Debug, Default)]
+pub struct Doc {
+    pub lines: Vec<Line>,
+    pub links: Vec<String>,
+    pub code: Vec<CodeBlock>,
+}
+
+impl Doc {
+    pub fn build(text: &str, width: usize, tab: usize) -> Self {
+        let mut builder = Builder::new(width.max(1), tab);
+        for (event, range) in Parser::new_ext(text, options()).into_offset_iter() {
+            builder.event(event, range);
+        }
+        builder.finish()
+    }
+
+    /// Строка просмотра, показывающая байт исходного текста.
+    pub fn line_at(&self, src: usize) -> usize {
+        let mut line = self
+            .lines
+            .partition_point(|l| l.src <= src)
+            .saturating_sub(1);
+        // Блок начинается с первой непустой строки с тем же местом.
+        while line > 0
+            && self.lines[line - 1].src == self.lines[line].src
+            && !self.lines[line - 1].is_blank()
+        {
+            line -= 1;
+        }
+        line
+    }
+}
+
+impl Line {
+    fn is_blank(&self) -> bool {
+        self.code.is_none() && self.spans.iter().all(|s| s.text.trim().is_empty())
+    }
+}
+
+fn options() -> Options {
+    Options::ENABLE_TABLES
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_GFM
+        | Options::ENABLE_MATH
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+}
+
+/// Отступ вложенного блока: маркер в первой строке, выравнивание в остальных.
+struct Prefix {
+    first: String,
+    rest: String,
+    mark: Mark,
+    width: usize,
+    used: bool,
+}
+
+struct List {
+    next: Option<u64>,
+    /// Между пунктами есть пустые строки.
+    loose: bool,
+}
+
+struct Builder {
+    doc: Doc,
+    width: usize,
+    tab: usize,
+    prefixes: Vec<Prefix>,
+    prefix_width: usize,
+    lists: Vec<List>,
+    inline: Inline,
+    marks: Vec<Mark>,
+    link: Option<u32>,
+    images: Vec<String>,
+    need_blank: bool,
+    table: Option<Table>,
+    code: Option<CodeBlock>,
+    /// Текст, который выводится как есть: HTML, метаданные, содержимое кода.
+    raw: Option<String>,
+    heading: Option<HeadingLevel>,
+    /// Начало текущего блока.
+    src: usize,
+}
+
+impl Builder {
+    fn new(width: usize, tab: usize) -> Self {
+        Self {
+            doc: Doc::default(),
+            width,
+            tab,
+            prefixes: Vec::new(),
+            prefix_width: 0,
+            lists: Vec::new(),
+            inline: Inline::default(),
+            marks: Vec::new(),
+            link: None,
+            images: Vec::new(),
+            need_blank: false,
+            table: None,
+            code: None,
+            raw: None,
+            heading: None,
+            src: 0,
+        }
+    }
+
+    fn finish(mut self) -> Doc {
+        self.flush();
+        // Поиск места в документе требует неубывающих позиций.
+        let mut last = 0;
+        for line in &mut self.doc.lines {
+            last = line.src.max(last);
+            line.src = last;
+        }
+        self.doc
+    }
+
+    // --- События ---
+
+    fn event(&mut self, event: Event, range: Range<usize>) {
+        match event {
+            Event::Start(tag) => self.start(tag, range.start),
+            Event::End(tag) => self.end(tag),
+            Event::Text(text) => match &mut self.raw {
+                Some(raw) => raw.push_str(&text),
+                None => self.push(&text, Mark::TEXT, range.start),
+            },
+            Event::Code(text) => self.push(&text, Mark::tone(Tone::Code), range.start),
+            Event::InlineMath(text) => {
+                self.push(&format!("${text}$"), Mark::tone(Tone::Code), range.start);
+            }
+            Event::DisplayMath(text) => {
+                let text = text.replace(['\r', '\n'], " ");
+                self.push(&format!("$${text}$$"), Mark::tone(Tone::Code), range.start);
+            }
+            Event::Html(text) => match &mut self.raw {
+                Some(raw) => raw.push_str(&text),
+                None => self.push(&text, Mark::tone(Tone::Html), range.start),
+            },
+            Event::InlineHtml(text) => {
+                let text = text.replace(['\r', '\n'], " ");
+                self.push(&text, Mark::tone(Tone::Html), range.start);
+            }
+            Event::FootnoteReference(label) => {
+                self.push(&format!("[{label}]"), Mark::tone(Tone::Link), range.start);
+            }
+            Event::SoftBreak => self.push(" ", Mark::TEXT, range.start),
+            Event::HardBreak => self.push("\n", Mark::TEXT, range.start),
+            Event::Rule => {
+                self.begin(range.start);
+                let rule = "─".repeat(self.available());
+                self.emit(vec![Span::new(rule, Mark::tone(Tone::Dim))], range.start);
+                self.need_blank = true;
+            }
+            Event::TaskListMarker(done) => self.task(done),
+        }
+    }
+
+    fn start(&mut self, tag: Tag, src: usize) {
+        match tag {
+            Tag::Paragraph => {
+                if let Some(list) = self.lists.last_mut() {
+                    list.loose = true;
+                }
+                self.begin(src);
+            }
+            Tag::Heading { level, .. } => {
+                self.begin(src);
+                self.heading = Some(level);
+                self.marks.push(heading_mark(level));
+            }
+            Tag::BlockQuote(kind) => {
+                self.begin(src);
+                self.push_prefix("▌ ".into(), "▌ ".into(), Mark::tone(Tone::Quote));
+                if let Some(kind) = kind {
+                    let mark = Mark::tone(Tone::Quote).bold();
+                    self.emit(vec![Span::new(alert_name(kind), mark)], src);
+                }
+            }
+            Tag::CodeBlock(kind) => {
+                self.begin(src);
+                let info = match &kind {
+                    CodeBlockKind::Fenced(info) => info,
+                    CodeBlockKind::Indented => "",
+                };
+                let lang = info.split([' ', ',', '{', '\t']).next().unwrap_or_default();
+                self.code = Some(CodeBlock {
+                    lang: lang.to_owned(),
+                    lines: Vec::new(),
+                });
+                self.raw = Some(String::new());
+            }
+            Tag::HtmlBlock | Tag::MetadataBlock(_) => {
+                self.begin(src);
+                self.raw = Some(String::new());
+            }
+            Tag::List(next) => {
+                self.begin(src);
+                self.lists.push(List { next, loose: false });
+            }
+            Tag::Item => {
+                self.begin(src);
+                let marker = self.marker();
+                let rest = " ".repeat(layout::width(&marker, self.tab));
+                self.push_prefix(marker, rest, Mark::tone(Tone::Marker));
+            }
+            Tag::FootnoteDefinition(label) => {
+                self.begin(src);
+                let marker = format!("[{label}] ");
+                self.push_prefix(marker, "    ".into(), Mark::tone(Tone::Link));
+                // Абзацы сноски не относятся к списку вокруг неё.
+                self.lists.push(List {
+                    next: None,
+                    loose: false,
+                });
+            }
+            Tag::Table(alignments) => {
+                self.begin(src);
+                self.table = Some(Table::new(alignments));
+            }
+            Tag::TableHead | Tag::TableRow => {
+                if let Some(table) = &mut self.table {
+                    table.start_row(src);
+                }
+            }
+            Tag::TableCell => self.inline = Inline::default(),
+            Tag::Emphasis => self.marks.push(Mark::TEXT.italic()),
+            Tag::Strong => self.marks.push(Mark::TEXT.bold()),
+            Tag::Strikethrough => self.marks.push(Mark::TEXT.strike()),
+            Tag::Link { dest_url, .. } => {
+                self.link = Some(self.add_link(dest_url.into_string()));
+                self.marks.push(Mark::tone(Tone::Link).underline());
+            }
+            Tag::Image { dest_url, .. } => {
+                self.marks.push(Mark::tone(Tone::Link));
+                self.push("▣ ", Mark::TEXT, src);
+                self.images.push(dest_url.into_string());
+            }
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph => {
+                self.flush();
+                self.need_blank = true;
+            }
+            TagEnd::Heading(level) => {
+                self.flush();
+                self.marks.pop();
+                self.heading = None;
+                let rule = match level {
+                    HeadingLevel::H1 => "═",
+                    HeadingLevel::H2 => "─",
+                    _ => "",
+                };
+                if !rule.is_empty() {
+                    let rule = rule.repeat(self.available());
+                    self.emit(vec![Span::new(rule, Mark::tone(Tone::Heading))], self.src);
+                }
+                self.need_blank = true;
+            }
+            TagEnd::BlockQuote(_) => {
+                self.flush();
+                self.pop_prefix();
+                self.need_blank = true;
+            }
+            TagEnd::CodeBlock => {
+                self.emit_code();
+                self.need_blank = true;
+            }
+            TagEnd::HtmlBlock | TagEnd::MetadataBlock(_) => {
+                self.emit_raw();
+                self.need_blank = true;
+            }
+            TagEnd::List(_) => {
+                self.lists.pop();
+                self.need_blank = self.lists.last().is_none_or(|l| l.loose);
+            }
+            TagEnd::Item => {
+                self.end_marked_block();
+                self.need_blank = self.lists.last().is_some_and(|l| l.loose);
+            }
+            TagEnd::FootnoteDefinition => {
+                self.end_marked_block();
+                self.lists.pop();
+                self.need_blank = true;
+            }
+            TagEnd::Table => {
+                if let Some(table) = self.table.take() {
+                    for (spans, src) in table.lay_out(self.available(), self.tab) {
+                        self.emit(spans, src);
+                    }
+                }
+                self.need_blank = true;
+            }
+            TagEnd::TableCell => {
+                let mut cell = std::mem::take(&mut self.inline);
+                cell.find_links(&mut self.doc.links);
+                if let Some(table) = &mut self.table {
+                    table.push_cell(cell);
+                }
+            }
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
+                self.marks.pop();
+            }
+            TagEnd::Link => {
+                self.marks.pop();
+                self.link = None;
+            }
+            TagEnd::Image => {
+                if let Some(dest) = self.images.pop() {
+                    // Адрес нужен, пока сама картинка не показана.
+                    self.push(&format!(" ({dest})"), Mark::tone(Tone::Dim), self.src);
+                }
+                self.marks.pop();
+            }
+            _ => {}
+        }
+    }
+
+    // --- Строчное содержимое ---
+
+    fn push(&mut self, text: &str, mark: Mark, src: usize) {
+        let outer = self.marks.iter().fold(Mark::TEXT, |a, b| a.with(*b));
+        self.inline.push(text, outer.with(mark), self.link, src);
+    }
+
+    fn add_link(&mut self, url: String) -> u32 {
+        self.doc.links.push(url);
+        self.doc.links.len() as u32 - 1
+    }
+
+    /// Выводит накопленный абзац.
+    fn flush(&mut self) {
+        if self.inline.is_empty() {
+            return;
+        }
+        let mut inline = std::mem::take(&mut self.inline);
+        inline.find_links(&mut self.doc.links);
+        for (spans, src) in inline.wrap(self.available(), self.tab) {
+            self.emit(spans, src);
+        }
+    }
+
+    // --- Блоки ---
+
+    /// Начинает блок: завершает предыдущий текст и отделяет пустой строкой.
+    fn begin(&mut self, src: usize) {
+        self.flush();
+        self.src = src;
+        if std::mem::take(&mut self.need_blank) {
+            let mut spans = Vec::new();
+            let mut used = 0;
+            for p in &self.prefixes {
+                if used >= self.width {
+                    break;
+                }
+                used += p.width;
+                spans.push(Span::new(p.rest.clone(), p.mark));
+            }
+            self.doc.lines.push(Line {
+                spans,
+                code: None,
+                src,
+            });
+        }
+    }
+
+    fn available(&self) -> usize {
+        self.width
+            .saturating_sub(self.prefix_width)
+            .max(MIN_CONTENT)
+    }
+
+    fn push_prefix(&mut self, first: String, rest: String, mark: Mark) {
+        let width = layout::width(&first, self.tab);
+        self.prefix_width += width;
+        self.prefixes.push(Prefix {
+            first,
+            rest,
+            mark,
+            width,
+            used: false,
+        });
+    }
+
+    fn pop_prefix(&mut self) {
+        if let Some(p) = self.prefixes.pop() {
+            self.prefix_width -= p.width;
+        }
+    }
+
+    /// Завершает пункт списка или сноску. Пустой пункт показывает один маркер.
+    fn end_marked_block(&mut self) {
+        self.flush();
+        if self.prefixes.last().is_some_and(|p| !p.used) {
+            self.emit(Vec::new(), self.src);
+        }
+        self.pop_prefix();
+    }
+
+    fn marker(&mut self) -> String {
+        const BULLETS: [&str; 3] = ["• ", "◦ ", "▪ "];
+        let depth = self.lists.len().saturating_sub(1);
+        match self.lists.last_mut().and_then(|l| l.next.as_mut()) {
+            Some(number) => {
+                let marker = format!("{number}. ");
+                *number = number.saturating_add(1);
+                marker
+            }
+            None => BULLETS[depth % BULLETS.len()].into(),
+        }
+    }
+
+    fn task(&mut self, done: bool) {
+        let box_ = if done { "☑ " } else { "☐ " };
+        let numbered = self.lists.last().is_some_and(|l| l.next.is_some());
+        let Some(p) = self.prefixes.last_mut().filter(|p| !p.used) else {
+            return;
+        };
+        if numbered {
+            p.first.push_str(box_);
+        } else {
+            p.first = box_.into();
+        }
+        let width = layout::width(&p.first, self.tab);
+        p.rest = " ".repeat(width);
+        self.prefix_width = self.prefix_width - p.width + width;
+        p.width = width;
+    }
+
+    /// Отступы текущей строки. Глубже ширины экрана они не нужны.
+    fn prefix_spans(&mut self) -> Vec<Span> {
+        let mut spans = Vec::new();
+        let mut used = 0;
+        for p in &mut self.prefixes {
+            if used >= self.width {
+                break;
+            }
+            used += p.width;
+            let text = if p.used { &p.rest } else { &p.first };
+            p.used = true;
+            spans.push(Span::new(text.clone(), p.mark));
+        }
+        spans
+    }
+
+    fn emit(&mut self, spans: Vec<Span>, src: usize) {
+        let mut all = self.prefix_spans();
+        all.extend(spans);
+        self.doc.lines.push(Line {
+            spans: all,
+            code: None,
+            src,
+        });
+    }
+
+    fn emit_raw(&mut self) {
+        let raw = self.raw.take().unwrap_or_default();
+        let mut inline = Inline::default();
+        let mut src = self.src;
+        for line in raw.trim_end().split_inclusive('\n') {
+            let text = line.trim_end_matches(['\r', '\n']);
+            inline.push(text, Mark::tone(Tone::Html), None, src);
+            src += line.len();
+            for (spans, src) in std::mem::take(&mut inline).wrap(self.available(), self.tab) {
+                self.emit(spans, src);
+            }
+        }
+    }
+
+    fn emit_code(&mut self) {
+        let raw = self.raw.take().unwrap_or_default();
+        let mut block = self.code.take().unwrap_or_default();
+        let dim = Mark::tone(Tone::Dim);
+        let top = if block.lang.is_empty() {
+            "┌─".into()
+        } else {
+            format!("┌─ {}", block.lang)
+        };
+        self.emit(vec![Span::new(top, dim)], self.src);
+
+        let index = self.doc.code.len() as u32;
+        let width = self.available().saturating_sub(2).max(MIN_CONTENT);
+        // Точное место строк в исходнике из-за отступов неизвестно, хватает оценки.
+        let mut src = self.src;
+        for (number, line) in raw.lines().enumerate() {
+            src += line.len() + 1;
+            for row in layout::rows(line, Some(width), self.tab) {
+                let mut spans = self.prefix_spans();
+                spans.push(Span::new("│ ", dim));
+                self.doc.lines.push(Line {
+                    spans,
+                    code: Some(CodeRef {
+                        block: index,
+                        line: number as u32,
+                        bytes: row.byte_start..row.byte_end,
+                    }),
+                    src,
+                });
+            }
+        }
+        self.emit(vec![Span::new("└─", dim)], src);
+        block.lines = raw.lines().map(str::to_owned).collect();
+        self.doc.code.push(block);
+    }
+}
+
+fn heading_mark(level: HeadingLevel) -> Mark {
+    let mark = Mark::tone(Tone::Heading);
+    match level {
+        HeadingLevel::H1 | HeadingLevel::H2 | HeadingLevel::H3 => mark.bold(),
+        HeadingLevel::H4 => mark,
+        _ => mark.italic(),
+    }
+}
+
+fn alert_name(kind: BlockQuoteKind) -> &'static str {
+    match kind {
+        BlockQuoteKind::Note => "Note",
+        BlockQuoteKind::Tip => "Tip",
+        BlockQuoteKind::Important => "Important",
+        BlockQuoteKind::Warning => "Warning",
+        BlockQuoteKind::Caution => "Caution",
+    }
+}
+
+#[cfg(test)]
+mod tests;

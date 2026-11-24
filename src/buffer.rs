@@ -3,6 +3,7 @@
 //! Позиции измеряются в символах (`char`) от начала документа. Переводы строк
 //! хранятся как в файле, поэтому нетронутый текст сохраняется побайтно.
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -88,6 +89,8 @@ struct Step {
 pub struct Buffer {
     rope: Rope,
     revision: u64,
+    /// Верхняя строка, изменённая с прошлого вопроса.
+    changed_line: Option<usize>,
     cursor: usize,
     anchor: Option<usize>,
     pub ends: LineEnds,
@@ -104,6 +107,18 @@ fn next_revision() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+fn head(text: &str, limit: usize) -> &str {
+    let text = match text.strip_suffix('\n') {
+        Some(line) => line.strip_suffix('\r').unwrap_or(line),
+        None => text,
+    };
+    let mut end = limit.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn char_count(s: &str) -> usize {
     s.chars().count()
 }
@@ -113,6 +128,7 @@ impl Buffer {
         Self {
             rope: Rope::from_str(text),
             revision: next_revision(),
+            changed_line: Some(0),
             cursor: 0,
             anchor: None,
             ends: LineEnds::detect(text),
@@ -143,6 +159,34 @@ impl Buffer {
         self.revision
     }
 
+    fn changed(&mut self, at: usize) {
+        self.revision = next_revision();
+        let line = self.rope.char_to_line(at);
+        self.changed_line = Some(self.changed_line.map_or(line, |l| l.min(line)));
+    }
+
+    pub fn take_changed_line(&mut self) -> Option<usize> {
+        self.changed_line.take()
+    }
+
+    /// Дешёвая копия текста для другого потока.
+    pub fn rope(&self) -> Rope {
+        self.rope.clone()
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.rope.len_bytes()
+    }
+
+    pub fn byte_of(&self, pos: usize) -> usize {
+        self.rope.char_to_byte(pos)
+    }
+
+    /// Позиция символа, содержащего байт.
+    pub fn pos_of_byte(&self, byte: usize) -> usize {
+        self.rope.byte_to_char(byte.min(self.byte_len()))
+    }
+
     pub fn line_count(&self) -> usize {
         self.rope.len_lines()
     }
@@ -167,6 +211,26 @@ impl Buffer {
     /// Текст строки без перевода строки.
     pub fn line(&self, line: usize) -> String {
         self.slice(self.line_start(line)..self.line_end(line))
+    }
+
+    /// Начала строк подряд, каждое не длиннее `limit` байт, без перевода строки.
+    pub fn line_heads(&self, from: usize, limit: usize) -> impl Iterator<Item = Cow<'_, str>> {
+        self.rope
+            .lines_at(from)
+            .map(move |line| match line.as_str() {
+                Some(text) => Cow::Borrowed(head(text, limit)),
+                // Строка лежит в нескольких кусках дерева.
+                None => {
+                    let mut text = String::new();
+                    for chunk in line.chunks() {
+                        text.push_str(chunk);
+                        if text.len() >= limit {
+                            break;
+                        }
+                    }
+                    Cow::Owned(head(&text, limit).to_owned())
+                }
+            })
     }
 
     pub fn slice(&self, range: Range<usize>) -> String {
@@ -380,7 +444,7 @@ impl Buffer {
         };
         self.rope.remove(range);
         self.rope.insert(edit.at, &edit.inserted);
-        self.revision = next_revision();
+        self.changed(edit.at);
         self.cursor = edit.at + char_count(&edit.inserted);
         self.anchor = None;
         self.redo.clear();
@@ -446,7 +510,7 @@ impl Buffer {
         } = &step.edit;
         self.rope.remove(*at..*at + char_count(inserted));
         self.rope.insert(*at, removed);
-        self.revision = next_revision();
+        self.changed(step.edit.at);
         self.restore(step.before);
         if let Some((before, _)) = step.ends {
             self.ends = before;
@@ -467,7 +531,7 @@ impl Buffer {
         } = &step.edit;
         self.rope.remove(*at..*at + char_count(removed));
         self.rope.insert(*at, inserted);
-        self.revision = next_revision();
+        self.changed(step.edit.at);
         self.restore(step.after);
         if let Some((_, after)) = step.ends {
             self.ends = after;
@@ -623,6 +687,19 @@ mod tests {
         assert_eq!(b.line(0), "a\u{2028}b\rc\u{b}d");
         assert_eq!(b.line(1), "e");
         assert_eq!(Buffer::new("a\r").line(0), "a\r");
+    }
+
+    #[test]
+    fn line_heads_match_lines() {
+        let text = format!("a\r\n{}\n\nж{}\r\n", "б".repeat(5000), "я".repeat(300));
+        let b = Buffer::new(&text);
+        let heads: Vec<_> = b.line_heads(0, 101).collect();
+        assert_eq!(heads.len(), b.line_count());
+        for (i, h) in heads.iter().enumerate() {
+            assert!(h.len() <= 101 && b.line(i).starts_with(&**h));
+        }
+        assert_eq!(heads[0], "a");
+        assert_eq!(b.line_heads(3, 2).next().unwrap(), "ж");
     }
 
     #[test]
