@@ -61,7 +61,7 @@ impl Table {
                     .map(|c| match row.cells.get(c) {
                         Some(cell) => {
                             let lines = cell.wrap(widths[c], tab);
-                            lines.into_iter().map(|(spans, _)| spans).collect()
+                            lines.into_iter().map(|(spans, ..)| spans).collect()
                         }
                         None => Vec::new(),
                     })

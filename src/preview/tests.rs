@@ -185,14 +185,26 @@ fn links() {
         "[т](http://a.ru) <http://b.ru> https://c.ru/x_y_z, www.d.ru e@f.ru `http://g.ru` file.md",
         200,
     );
-    let url = |t: &str| d.links[find(&d, t).link.unwrap() as usize].as_str();
+    let url = |t: &str| match &d.items[find(&d, t).item.unwrap() as usize] {
+        Item::Link(url) => url.as_str(),
+        other => panic!("{other:?}"),
+    };
     assert_eq!(url("т"), "http://a.ru");
     assert_eq!(url("http://b.ru"), "http://b.ru");
     assert_eq!(url("https://c.ru/x_y_z"), "https://c.ru/x_y_z");
     assert_eq!(url("www.d.ru"), "http://www.d.ru");
     assert_eq!(url("e@f.ru"), "mailto:e@f.ru");
-    assert_eq!(find(&d, "http://g.ru").link, None);
-    assert_eq!(d.links.len(), 5);
+    assert_eq!(find(&d, "http://g.ru").item, None);
+    assert_eq!(d.items.len(), 5);
+    // Порядок выбора совпадает с порядком на экране.
+    let order: Vec<_> = d.order.iter().map(|(i, _)| *i).collect();
+    let shown: Vec<_> = d
+        .lines
+        .iter()
+        .flat_map(|l| &l.spans)
+        .filter_map(|s| s.item)
+        .collect();
+    assert_eq!(order, shown);
 }
 
 #[test]
@@ -202,7 +214,7 @@ fn link_survives_wrapping() {
         .lines
         .iter()
         .flat_map(|l| &l.spans)
-        .filter(|s| s.link.is_some());
+        .filter(|s| s.item.is_some());
     let text: String = linked.map(|s| s.text.as_str()).collect();
     assert_eq!(text, "https://example.com/aaaaaaaaaaaaaaaaaaaa");
 }
@@ -273,4 +285,50 @@ fn any_width_and_odd_input_do_not_panic() {
     {
         doc(&text[..end], 20);
     }
+}
+
+#[test]
+fn tasks_know_their_place() {
+    let text = "- [ ] а\n1. [x] б\n\n> - [X] в\n";
+    let d = doc(text, 40);
+    let tasks: Vec<_> = d
+        .items
+        .iter()
+        .map(|i| match i {
+            Item::Task { src, done } => (&text[*src..*src + 3], *done),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(tasks, [("[ ]", false), ("[x]", true), ("[X]", true)]);
+    assert_eq!(d.order.len(), 3);
+}
+
+#[test]
+fn headings_have_unique_slugs() {
+    let text = "# Один `код`\n\nтекст\n\n## Два\n## Два\n\n```\n# нет\n```\n\nТри\n===\n";
+    let got: Vec<_> = headings(text)
+        .into_iter()
+        .map(|h| (h.level, h.text, h.slug))
+        .collect();
+    let want = [
+        (1, "Один код", "один-код"),
+        (2, "Два", "два"),
+        (2, "Два", "два-1"),
+        (1, "Три", "три"),
+    ];
+    assert_eq!(got, want.map(|(l, t, s)| (l, t.to_owned(), s.to_owned())));
+}
+
+#[test]
+fn wrapped_lines_know_how_they_join() {
+    let d = doc("> один два\n\n```\nabcdefgh\n```\n\nдлинноеслово", 8);
+    let joins: Vec<_> = d
+        .lines
+        .iter()
+        .filter(|l| !l.is_blank())
+        .map(|l| l.join)
+        .collect();
+    use Join::*;
+    assert_eq!(joins, [New, Space, New, New, Glue, New, New, Glue]);
+    assert_eq!(d.lines[1].prefix, 1);
 }

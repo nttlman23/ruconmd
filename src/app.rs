@@ -1,5 +1,9 @@
 //! Состояние программы и реакция на ввод. Отрисовки и терминала здесь нет.
 
+mod find;
+mod markup;
+mod navigate;
+
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -9,15 +13,17 @@ use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEven
 use crate::buffer::{Buffer, Eol};
 use crate::clipboard::Clipboard;
 use crate::command::{Command, Mode};
-use crate::dialog::{Action, Ask, Dialog, Field, Menu, Outcome, SaveJob};
+use crate::dialog::{Action, Ask, Dialog, Field, Location, Menu, Outcome, SaveJob, Then};
 use crate::encoding::{self, Enc, Format, Unencodable};
 use crate::file::{self, ReadError};
 use crate::i18n::Lang;
 use crate::input::Input;
 use crate::key::{Chord, Key};
 use crate::keymap::Keymap;
+use crate::links::Opener;
 use crate::mdline::States;
 use crate::pane::Pane;
+use crate::search::{Query, Search};
 use crate::view::{Place, Settings, Viewport};
 
 const WHEEL_LINES: isize = 3;
@@ -65,6 +71,15 @@ pub struct App {
     /// Файл прочитан с потерями, запись в него требует подтверждения.
     lossy: bool,
     clipboard: Box<dyn Clipboard>,
+    opener: Box<dyn Opener>,
+    /// Поиск, совпадения которого подсвечены.
+    pub search: Option<Search>,
+    query: Query,
+    replace_with: String,
+    /// Пустое совпадение, на котором стоит курсор.
+    last_empty_hit: Option<usize>,
+    /// Откуда приходили по ссылкам.
+    history: Vec<Location>,
     area: TextArea,
     /// Колонка, к которой стремится курсор при движении вверх и вниз.
     goal: Option<usize>,
@@ -106,7 +121,11 @@ fn load(path: &Path, forced: Option<Enc>, lang: Lang) -> io::Result<Loaded> {
 }
 
 impl App {
-    pub fn open(options: Options, clipboard: Box<dyn Clipboard>) -> io::Result<Self> {
+    pub fn open(
+        options: Options,
+        clipboard: Box<dyn Clipboard>,
+        opener: Box<dyn Opener>,
+    ) -> io::Result<Self> {
         let lang = options.lang;
         let loaded = match &options.path {
             Some(path) => load(path, options.encoding, lang)?,
@@ -134,6 +153,12 @@ impl App {
             saved_format: Format::UTF8,
             lossy: false,
             clipboard,
+            opener,
+            search: None,
+            query: Query::default(),
+            replace_with: String::new(),
+            last_empty_hit: None,
+            history: Vec::new(),
             area: TextArea::default(),
             goal: None,
             follow: true,
@@ -196,6 +221,7 @@ impl App {
         let width = width.min(PREVIEW_WIDTH);
         let tab = self.view.settings.tab_width;
         self.pane.prepare(&self.buffer, width, height, tab);
+        self.pane.set_search(self.search.as_ref());
         self.pane.highlight(Instant::now() + HIGHLIGHT_BUDGET);
     }
 
@@ -219,7 +245,7 @@ impl App {
         self.help = false;
         match &mut self.dialog {
             Some(Dialog::Field(field)) => field.insert(text),
-            Some(Dialog::Menu(_)) => {}
+            Some(Dialog::Menu(_) | Dialog::Replace(_)) => {}
             None if self.mode == Mode::Edit => {
                 self.message = None;
                 self.buffer.paste(text, continued);
@@ -231,6 +257,12 @@ impl App {
 
     fn key(&mut self, chord: Chord) {
         self.message = None;
+        if let Some(Dialog::Replace(_)) = &self.dialog {
+            return self.replace_key(chord);
+        }
+        if self.find_option(chord) {
+            return;
+        }
         if let Some(dialog) = &mut self.dialog {
             let outcome = dialog.key(chord);
             return self.dialog_outcome(outcome);
@@ -256,6 +288,10 @@ impl App {
             Key::PageDown => self.pane.scroll(page),
             Key::Home => self.pane.scroll_to_start(),
             Key::End => self.pane.scroll_to_end(),
+            Key::Esc => {
+                self.pane.clear_selection();
+                self.search = None;
+            }
             _ => {}
         }
     }
@@ -273,13 +309,11 @@ impl App {
                 self.edited();
             }
             Key::Enter => {
-                self.buffer.type_text("\n");
+                self.enter();
                 self.edited();
             }
-            Key::Tab if mods.is_none() => {
-                let tab = self.view.settings.tab_width;
-                let (_, column) = self.cursor_line_column();
-                self.buffer.type_text(&" ".repeat(tab - (column - 1) % tab));
+            Key::Tab if !ctrl => {
+                self.tab(mods.shift);
                 self.edited();
             }
             Key::Backspace => {
@@ -328,7 +362,10 @@ impl App {
                 let to = self.row_end(cursor);
                 self.move_to(to, select);
             }
-            Key::Esc => self.buffer.clear_selection(),
+            Key::Esc => {
+                self.buffer.clear_selection();
+                self.search = None;
+            }
             _ => {}
         }
     }
@@ -337,10 +374,21 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.wheel(-WHEEL_LINES),
             MouseEventKind::ScrollDown => self.wheel(WHEEL_LINES),
+            MouseEventKind::Down(MouseButton::Left) if self.mode == Mode::View => {
+                let y = mouse.row.checked_sub(self.area.y);
+                if let Some(y) = y.filter(|y| *y < self.area.height)
+                    && self.dialog.is_none()
+                    && !self.help
+                    && self.pane.select_at(mouse.column as usize, y as usize)
+                {
+                    self.message = None;
+                    self.activate(false);
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let a = self.area;
                 let inside = (a.y..a.y + a.height).contains(&mouse.row);
-                if self.mode == Mode::Edit && self.dialog.is_none() && !self.help && inside {
+                if self.dialog.is_none() && !self.help && inside {
                     self.message = None;
                     self.dragging = true;
                     let extend = mouse.modifiers.contains(KeyModifiers::SHIFT);
@@ -450,10 +498,10 @@ impl App {
         match command {
             Command::ToggleMode => self.toggle_mode(),
             Command::Help => self.help = true,
-            Command::Quit if self.is_modified() => self.ask_quit(),
+            Command::Quit if self.is_modified() => self.ask_unsaved(Then::Quit),
             Command::Quit => self.should_quit = true,
-            Command::Save => self.save(false),
-            Command::SaveAs => self.ask_path(false),
+            Command::Save => self.save(Then::Stay),
+            Command::SaveAs => self.ask_path(Then::Stay),
             Command::Undo => {
                 if self.buffer.undo() {
                     self.edited();
@@ -492,10 +540,26 @@ impl App {
                 self.dialog = Some(Dialog::Field(field));
             }
             Command::Encoding => self.ask_encoding(),
-            other => {
-                let name = self.lang.command(other);
-                self.message = Some(format!("{name}: {}", s.not_implemented));
+            Command::Find => self.ask_find(Ask::Find),
+            Command::FindNext => self.find(true),
+            Command::FindPrev => self.find(false),
+            Command::Replace => self.ask_find(Ask::ReplaceFind),
+            Command::Outline => self.ask_outline(),
+            Command::Bold | Command::Italic | Command::Link => {
+                match command {
+                    Command::Bold => self.emphasis(2),
+                    Command::Italic => self.emphasis(1),
+                    _ => self.insert_link(),
+                }
+                self.edited();
             }
+            Command::NextItem => self.select_item(true),
+            Command::PrevItem => self.select_item(false),
+            Command::OpenItem => self.activate(false),
+            Command::ToggleCheckbox => self.activate(true),
+            Command::Back => self.go_back(),
+            // В просмотре копировать и выделять нечего.
+            Command::Copy | Command::SelectAll => {}
         }
     }
 
@@ -533,10 +597,12 @@ impl App {
         if !self.pane.is_scrolled() {
             return;
         }
-        let pos = self.buffer.pos_of_byte(self.pane.source_at_top());
+        let focus = self.pane.focus();
+        let src = focus.unwrap_or_else(|| self.pane.source_at_top());
+        let pos = self.buffer.pos_of_byte(src);
         self.view.top = self.view.locate(&self.buffer, pos).0;
         self.view.clamp(&self.buffer);
-        if !self.view.is_visible(&self.buffer, self.buffer.cursor()) {
+        if focus.is_some() || !self.view.is_visible(&self.buffer, self.buffer.cursor()) {
             self.move_to(pos, false);
             self.follow = false;
         }
@@ -548,23 +614,23 @@ impl App {
         self.dialog = Some(Dialog::Menu(Menu::new(title, items)));
     }
 
-    fn ask_quit(&mut self) {
+    fn ask_unsaved(&mut self, then: Then) {
         let s = self.lang.strings();
         self.menu(
             s.ask_quit,
             vec![
-                (s.save.into(), Action::SaveAndQuit),
-                (s.dont_save.into(), Action::QuitWithoutSaving),
+                (s.save.into(), Action::SaveThen(then.clone())),
+                (s.dont_save.into(), Action::Discard(then)),
                 (s.cancel.into(), Action::Cancel),
             ],
         );
     }
 
-    fn ask_path(&mut self, quit: bool) {
+    fn ask_path(&mut self, then: Then) {
         let path = self.path.as_ref();
         let text = path.map_or(String::new(), |p| p.display().to_string());
         let title = self.lang.strings().ask_path;
-        let field = Field::new(Ask::SavePath { quit }, title, text);
+        let field = Field::new(Ask::SavePath(then), title, text);
         self.dialog = Some(Dialog::Field(field));
     }
 
@@ -597,7 +663,7 @@ impl App {
             Outcome::Close => self.dialog = None,
             Outcome::Submit(ask, text) => {
                 self.dialog = None;
-                self.submit(ask, text.trim());
+                self.submit(ask, text);
             }
             Outcome::Act(action) => {
                 self.dialog = None;
@@ -606,17 +672,21 @@ impl App {
         }
     }
 
-    fn submit(&mut self, ask: Ask, text: &str) {
+    fn submit(&mut self, ask: Ask, text: String) {
+        let trimmed = text.trim();
         match ask {
-            Ask::GotoLine => match text.parse() {
+            Ask::Find => self.submit_find(text),
+            Ask::ReplaceFind => self.submit_replace_find(text),
+            Ask::ReplaceWith => self.submit_replace_with(text),
+            Ask::GotoLine => match trimmed.parse() {
                 Ok(line) => self.goto_line(line),
                 Err(_) => self.message = Some(self.lang.strings().bad_number.into()),
             },
-            Ask::SavePath { .. } if text.is_empty() => {}
-            Ask::SavePath { quit } => self.write(SaveJob {
-                path: PathBuf::from(text),
+            Ask::SavePath(_) if trimmed.is_empty() => {}
+            Ask::SavePath(then) => self.write(SaveJob {
+                path: PathBuf::from(trimmed),
                 format: self.format,
-                quit,
+                then,
                 overwrite: false,
                 allow_lossy: false,
             }),
@@ -628,8 +698,9 @@ impl App {
         match action {
             Action::Cancel => {}
             Action::Save(job) => self.write(job),
-            Action::SaveAndQuit => self.save(true),
-            Action::QuitWithoutSaving => self.should_quit = true,
+            Action::SaveThen(then) => self.save(then),
+            Action::Discard(then) => self.proceed(then),
+            Action::GotoSrc(src) => self.goto_src(src),
             Action::Reload(_) if self.is_modified() => {
                 self.message = Some(s.save_first.into());
             }
@@ -652,16 +723,25 @@ impl App {
 
     // --- Запись ---
 
-    fn save(&mut self, quit: bool) {
+    /// Продолжает то, ради чего спрашивали о сохранении.
+    fn proceed(&mut self, then: Then) {
+        match then {
+            Then::Stay => {}
+            Then::Quit => self.should_quit = true,
+            Then::Go(location) => self.arrive(location),
+        }
+    }
+
+    fn save(&mut self, then: Then) {
         match self.path.clone() {
             Some(path) => self.write(SaveJob {
                 path,
                 format: self.format,
-                quit,
+                then,
                 overwrite: true,
                 allow_lossy: false,
             }),
-            None => self.ask_path(quit),
+            None => self.ask_path(then),
         }
     }
 
@@ -715,7 +795,7 @@ impl App {
                 self.saved_format = job.format;
                 self.lossy = false;
                 self.buffer.mark_saved();
-                self.should_quit = job.quit;
+                self.proceed(job.then);
             }
             Err(e) => {
                 self.message = Some(format!("{} {}: {e}", s.not_saved, job.path.display()));
@@ -730,6 +810,21 @@ mod tests {
     use crate::clipboard::Local;
     use std::fs;
 
+    /// Вместо системного приложения записывает адреса.
+    #[derive(Default)]
+    struct Opened;
+
+    thread_local! {
+        static URLS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    impl Opener for Opened {
+        fn open(&mut self, url: &str) -> io::Result<()> {
+            URLS.with_borrow_mut(|u| u.push(url.to_owned()));
+            Ok(())
+        }
+    }
+
     fn open(path: Option<PathBuf>, encoding: Option<Enc>) -> App {
         let options = Options {
             path,
@@ -738,7 +833,8 @@ mod tests {
             encoding,
             line: None,
         };
-        let mut app = App::open(options, Box::<Local>::default()).unwrap();
+        let mut app =
+            App::open(options, Box::<Local>::default(), Box::<Opened>::default()).unwrap();
         draw(&mut app);
         app
     }
@@ -1152,6 +1248,372 @@ mod tests {
         assert_eq!(app.mode, Mode::Edit);
     }
 
+    // --- Помощь при вводе ---
+
+    #[test]
+    fn enter_continues_and_finishes_lists() {
+        let mut app = with_text("");
+        type_in(&mut app, "1. один\nдва\n\nтекст");
+        assert_eq!(app.buffer.text(), "1. один\n2. два\nтекст");
+        let mut app = with_text("");
+        type_in(&mut app, "> - [x] а\nб");
+        assert_eq!(app.buffer.text(), "> - [x] а\n> - [ ] б");
+        press(&mut app, "ctrl+z");
+        assert_eq!(app.buffer.text(), "> - [x] а\n> - [ ] ");
+        press(&mut app, "ctrl+z");
+        assert_eq!(app.buffer.text(), "> - [x] а");
+    }
+
+    #[test]
+    fn enter_does_not_help_in_code_and_paste_is_verbatim() {
+        let mut app = with_text("```\n- a\n```\n");
+        press(&mut app, "down end enter");
+        assert_eq!(app.buffer.text(), "```\n- a\n\n```\n");
+        let mut app = with_text("- a");
+        press(&mut app, "end");
+        app.handle(Input::Paste {
+            text: "\n- b\n".into(),
+            continued: false,
+        });
+        assert_eq!(app.buffer.text(), "- a\n- b\n");
+    }
+
+    #[test]
+    fn enter_keeps_crlf() {
+        let mut app = with_text("- a\r\n- b\r\n");
+        press(&mut app, "end enter");
+        assert_eq!(app.buffer.text(), "- a\r\n- \r\n- b\r\n");
+        press(&mut app, "enter");
+        assert_eq!(app.buffer.text(), "- a\r\n\r\n- b\r\n");
+    }
+
+    #[test]
+    fn tab_nests_list_items_and_selected_lines() {
+        let mut app = with_text("- a\n- b\n1. c\n");
+        press(&mut app, "down end tab");
+        assert_eq!(app.buffer.text(), "- a\n  - b\n1. c\n");
+        assert_eq!(app.cursor_line_column(), (2, 6));
+        press(&mut app, "shift+tab shift+tab");
+        assert_eq!(app.buffer.text(), "- a\n- b\n1. c\n");
+        press(&mut app, "ctrl+a tab");
+        assert_eq!(app.buffer.text(), "  - a\n  - b\n   1. c\n");
+        press(&mut app, "ctrl+z");
+        assert_eq!(app.buffer.text(), "- a\n- b\n1. c\n");
+    }
+
+    #[test]
+    fn bold_and_italic_toggle() {
+        let mut app = with_text("слово тут");
+        press(&mut app, "ctrl+shift+right ctrl+b");
+        assert_eq!(app.buffer.text(), "**слово** тут");
+        press(&mut app, "alt+i");
+        assert_eq!(app.buffer.text(), "***слово*** тут");
+        press(&mut app, "ctrl+b");
+        assert_eq!(app.buffer.text(), "*слово* тут");
+        press(&mut app, "alt+i");
+        assert_eq!(app.buffer.text(), "слово тут");
+        press(&mut app, "ctrl+z ctrl+z ctrl+z ctrl+z");
+        assert!(!app.buffer.is_modified());
+    }
+
+    #[test]
+    fn bold_without_selection_and_inside_one() {
+        let mut app = with_text("");
+        press(&mut app, "ctrl+b");
+        type_in(&mut app, "x");
+        assert_eq!(app.buffer.text(), "**x**");
+        let mut app = with_text("");
+        press(&mut app, "ctrl+b ctrl+b");
+        assert_eq!(app.buffer.text(), "");
+        let mut app = with_text("**x**");
+        press(&mut app, "ctrl+a ctrl+b");
+        assert_eq!(app.buffer.text(), "x");
+        let mut app = with_text("   ");
+        press(&mut app, "ctrl+a ctrl+b");
+        assert_eq!(app.buffer.text(), "   ");
+    }
+
+    #[test]
+    fn link_insertion() {
+        let mut app = with_text("имя");
+        press(&mut app, "ctrl+a ctrl+k");
+        type_in(&mut app, "url");
+        assert_eq!(app.buffer.text(), "[имя](url)");
+        let mut app = with_text("https://a.ru");
+        press(&mut app, "ctrl+a ctrl+k");
+        type_in(&mut app, "имя");
+        assert_eq!(app.buffer.text(), "[имя](https://a.ru)");
+    }
+
+    // --- Поиск и замена ---
+
+    fn search_for(app: &mut App, key: &str, text: &str) {
+        press(app, key);
+        press(app, "home");
+        for _ in 0..40 {
+            press(app, "delete");
+        }
+        type_in(app, text);
+        press(app, "enter");
+    }
+
+    #[test]
+    fn find_goes_around_in_both_directions() {
+        let mut app = with_text("Кот и кот\nКОТ");
+        search_for(&mut app, "ctrl+f", "кот");
+        assert_eq!(app.buffer.selection(), Some(0..3));
+        assert_eq!(app.message.as_deref(), Some("1 of 3"));
+        press(&mut app, "f3 f3");
+        assert_eq!(app.buffer.selection(), Some(10..13));
+        press(&mut app, "f3");
+        assert_eq!(app.message.as_deref(), Some("1 of 3 (wrapped)"));
+        press(&mut app, "shift+f3");
+        assert_eq!(app.message.as_deref(), Some("3 of 3 (wrapped)"));
+        press(&mut app, "ctrl+f alt+c enter");
+        assert_eq!(app.message.as_deref(), Some("1 of 1 (wrapped)"));
+    }
+
+    #[test]
+    fn find_options_work_in_russian_layout() {
+        let mut app = with_text("a1 a2");
+        press(&mut app, "ctrl+f alt+к");
+        type_in(&mut app, "a\\d");
+        press(&mut app, "enter");
+        assert_eq!(app.message.as_deref(), Some("1 of 2"));
+        search_for(&mut app, "ctrl+f", "(");
+        assert!(matches!(&app.dialog, Some(Dialog::Field(f)) if f.title.contains("unclosed")));
+    }
+
+    #[test]
+    fn empty_matches_do_not_stop_the_search() {
+        let mut app = with_text("a\nb\nc");
+        press(&mut app, "ctrl+f alt+r");
+        type_in(&mut app, "^");
+        press(&mut app, "enter");
+        assert_eq!(app.cursor_line_column().0, 1);
+        press(&mut app, "f3");
+        assert_eq!(app.cursor_line_column().0, 2);
+        press(&mut app, "f3 f3");
+        assert_eq!(app.cursor_line_column().0, 1);
+    }
+
+    #[test]
+    fn replace_one_skip_and_rest() {
+        let mut app = with_text("a a a a a");
+        press(&mut app, "right right");
+        search_for(&mut app, "ctrl+r", "a");
+        type_in(&mut app, "aa");
+        press(&mut app, "enter enter space");
+        assert_eq!(app.buffer.text(), "a aa a a a");
+        app.handle(Input::Key(Chord::plain(Key::Char('ф'))));
+        // Пропущенное не тронуто, первое заменено на втором круге, вставленное нет.
+        assert_eq!(app.buffer.text(), "aa aa a aa aa");
+        assert_eq!(app.message.as_deref(), Some("Replaced: 4"));
+        press(&mut app, "ctrl+z");
+        assert_eq!(app.buffer.text(), "a aa a a a");
+    }
+
+    #[test]
+    fn replace_stops_after_one_circle() {
+        let mut app = with_text("x x x");
+        press(&mut app, "right right");
+        search_for(&mut app, "ctrl+r", "x");
+        type_in(&mut app, "xx");
+        press(&mut app, "enter enter enter enter");
+        assert_eq!(app.buffer.text(), "xx xx xx");
+        assert!(app.dialog.is_none());
+        assert_eq!(app.message.as_deref(), Some("Replaced: 3"));
+    }
+
+    #[test]
+    fn replace_with_groups_empty_matches_and_crlf() {
+        let mut app = with_text("a=1\r\nb=2\r\n");
+        press(&mut app, "ctrl+r alt+r");
+        type_in(&mut app, "(\\w)=(\\d)");
+        press(&mut app, "enter");
+        type_in(&mut app, "$2\\n$1");
+        press(&mut app, "enter");
+        app.handle(Input::Key(Chord::plain(Key::Char('A'))));
+        assert_eq!(app.buffer.text(), "1\r\na\r\n2\r\nb\r\n");
+
+        let mut app = with_text("a\nb");
+        press(&mut app, "ctrl+r alt+r");
+        type_in(&mut app, "^");
+        press(&mut app, "enter");
+        type_in(&mut app, "> ");
+        press(&mut app, "enter enter enter");
+        assert_eq!(app.buffer.text(), "> a\n> b");
+        assert!(app.dialog.is_none());
+    }
+
+    #[test]
+    fn replace_reports_nothing_found() {
+        let mut app = with_text("a");
+        search_for(&mut app, "ctrl+r", "z");
+        press(&mut app, "enter");
+        assert_eq!(app.message.as_deref(), Some("Not found"));
+        assert!(app.dialog.is_none() && !app.is_modified());
+    }
+
+    #[test]
+    fn preview_search_finds_rendered_text_across_wrapping() {
+        let text = format!(
+            "{}**найди** меня тут\n\n{}",
+            "слово ".repeat(12),
+            "x\n\n".repeat(50)
+        );
+        let mut app = with_text(&text);
+        press(&mut app, "f5");
+        search_for(&mut app, "ctrl+f", "слово найди меня");
+        assert_eq!(app.message.as_deref(), Some("1 of 1"));
+        assert!((0..10).any(|row| !app.pane.hits(row).is_empty()));
+        search_for(&mut app, "ctrl+f", "**");
+        assert_eq!(app.message.as_deref(), Some("Not found"));
+        press(&mut app, "esc");
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn preview_search_scrolls_to_matches_and_code() {
+        let text = format!("{}```\nцель\n```\n", "x\n\n".repeat(50));
+        let mut app = with_text(&text);
+        press(&mut app, "f5");
+        search_for(&mut app, "ctrl+f", "цель");
+        assert!((0..10).any(|row| app.pane.hits(row).iter().any(|(_, current)| *current)));
+    }
+
+    // --- Просмотр: выбор, ссылки, оглавление ---
+
+    #[test]
+    fn checkbox_is_toggled_from_preview() {
+        let text = format!("{}- [ ] дело\r\n- [X] ещё\r\n", "x\r\n\r\n".repeat(30));
+        let mut app = with_text(&text);
+        press(&mut app, "f5 end tab space");
+        assert!(app.buffer.text().contains("- [x] дело\r\n"));
+        let top = app.pane.source_at_top();
+        press(&mut app, "tab space");
+        assert!(app.buffer.text().ends_with("- [ ] ещё\r\n"));
+        assert_eq!(app.pane.source_at_top(), top, "the screen does not move");
+        press(&mut app, "space");
+        assert!(app.buffer.text().ends_with("- [x] ещё\r\n"));
+        press(&mut app, "f5 ctrl+z ctrl+z ctrl+z");
+        assert_eq!(app.buffer.text(), text);
+    }
+
+    #[test]
+    fn mouse_toggles_a_checkbox_in_preview() {
+        let mut app = with_text("текст\n\n- [ ] дело\n");
+        press(&mut app, "f5");
+        mouse(&mut app, DOWN, 10, 1);
+        assert!(!app.is_modified());
+        mouse(&mut app, DOWN, 1, 3);
+        assert_eq!(app.buffer.text(), "текст\n\n- [x] дело\n");
+    }
+
+    #[test]
+    fn web_links_go_to_the_system_and_others_do_not() {
+        let mut app = with_text("[a](https://a.ru) [b](file:///etc/passwd) [c](run.sh)");
+        press(&mut app, "f5 tab enter");
+        URLS.with_borrow(|u| assert_eq!(*u, ["https://a.ru"]));
+        press(&mut app, "tab enter");
+        press(&mut app, "tab enter");
+        assert!(app.message.as_deref().unwrap().contains("not opened"));
+        URLS.with_borrow(|u| assert_eq!(u.len(), 1));
+        press(&mut app, "space");
+        assert!(!app.is_modified());
+    }
+
+    #[test]
+    fn anchors_and_back() {
+        let chapters: String = (0..40)
+            .map(|i| format!("## Глава {i}\n\nтекст\n\n"))
+            .collect();
+        let mut app = with_text(&format!("[туда](#глава-30) [нет](#нет)\n\n{chapters}"));
+        press(&mut app, "f5");
+        let before = app.pane.source_at_top();
+        press(&mut app, "tab enter");
+        assert_eq!(app.pane.visible()[0].spans[0].text, "Глава 30");
+        press(&mut app, "alt+left");
+        assert_eq!(app.pane.source_at_top(), before);
+        press(&mut app, "alt+left");
+        assert_eq!(app.message.as_deref(), Some("Nowhere to go back"));
+        press(&mut app, "tab tab enter");
+        assert_eq!(app.message.as_deref(), Some("No such section"));
+        press(&mut app, "tab enter f5");
+        assert!(
+            app.buffer
+                .line(app.cursor_line_column().0 - 1)
+                .contains("30")
+        );
+    }
+
+    #[test]
+    fn links_between_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.md"), dir.path().join("b.md"));
+        fs::write(&a, "[b](b.md#два) [нет](none.md)").unwrap();
+        fs::write(&b, format!("# Один\n\n{}## Два\n", "x\n\n".repeat(30))).unwrap();
+        let mut app = open(Some(a.clone()), None);
+        press(&mut app, "f5 tab enter");
+        assert_eq!(app.path.as_ref(), Some(&b));
+        assert!(
+            app.pane
+                .visible()
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text == "Два"))
+        );
+        press(&mut app, "alt+left");
+        assert_eq!(app.path.as_ref(), Some(&a));
+        press(&mut app, "tab tab enter");
+        assert!(app.message.as_deref().unwrap().contains("no such file"));
+        assert!(!dir.path().join("none.md").exists());
+        assert_eq!(app.path.as_ref(), Some(&a));
+    }
+
+    #[test]
+    fn leaving_a_modified_file_asks_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.md"), dir.path().join("b.md"));
+        fs::write(&a, "[b](b.md)").unwrap();
+        fs::write(&b, "текст").unwrap();
+        let mut app = open(Some(a.clone()), None);
+        press(&mut app, "ctrl+end");
+        type_in(&mut app, "!");
+        press(&mut app, "f5 tab enter");
+        assert_eq!(app.path.as_ref(), Some(&a));
+        press(&mut app, "esc");
+        assert!(app.is_modified());
+        press(&mut app, "enter enter");
+        assert_eq!(app.path.as_ref(), Some(&b));
+        assert_eq!(fs::read_to_string(&a).unwrap(), "[b](b.md)!");
+        press(&mut app, "f5");
+        type_in(&mut app, "z");
+        press(&mut app, "f5 alt+left down enter");
+        assert_eq!(app.path.as_ref(), Some(&a));
+        assert_eq!(fs::read_to_string(&b).unwrap(), "текст", "discarded");
+    }
+
+    #[test]
+    fn outline_works_in_both_modes() {
+        let chapters: String = (0..40)
+            .map(|i| format!("## Глава {i}\n\nтекст\n\n"))
+            .collect();
+        let mut app = with_text(&chapters);
+        press(&mut app, "ctrl+t pagedown enter");
+        assert_eq!(app.cursor_line_column().0, 41);
+        press(&mut app, "ctrl+t down enter");
+        assert_eq!(
+            app.cursor_line_column().0,
+            45,
+            "opens at the current heading"
+        );
+        press(&mut app, "f5 ctrl+t end enter f5");
+        assert_eq!(app.cursor_line_column().0, 157);
+        let mut app = with_text("текст");
+        press(&mut app, "ctrl+t");
+        assert!(app.dialog.is_none() && app.message.is_some());
+    }
+
     #[test]
     fn directory_is_an_error() {
         let options = Options {
@@ -1161,6 +1623,6 @@ mod tests {
             encoding: None,
             line: None,
         };
-        assert!(App::open(options, Box::<Local>::default()).is_err());
+        assert!(App::open(options, Box::<Local>::default(), Box::<Opened>::default()).is_err());
     }
 }

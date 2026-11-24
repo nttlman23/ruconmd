@@ -3,6 +3,7 @@
 mod inline;
 mod table;
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use pulldown_cmark::{
@@ -10,6 +11,7 @@ use pulldown_cmark::{
 };
 
 use crate::layout;
+use crate::links;
 use crate::style::{Mark, Tone};
 use inline::Inline;
 use table::Table;
@@ -21,8 +23,8 @@ const MIN_CONTENT: usize = 4;
 pub struct Span {
     pub text: String,
     pub mark: Mark,
-    /// Номер в [`Doc::links`].
-    pub link: Option<u32>,
+    /// Номер в [`Doc::items`].
+    pub item: Option<u32>,
 }
 
 impl Span {
@@ -30,9 +32,31 @@ impl Span {
         Self {
             text: text.into(),
             mark,
-            link: None,
+            item: None,
         }
     }
+}
+
+/// Как строка экрана продолжает предыдущую.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Join {
+    /// Новая строка текста.
+    New,
+    /// Перенос по пробелу.
+    Space,
+    /// Разрыв внутри слова.
+    Glue,
+}
+
+/// То, что можно выбрать в просмотре.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    Link(String),
+    /// Чекбокс: место `[ ]` в исходном тексте и отметка.
+    Task {
+        src: usize,
+        done: bool,
+    },
 }
 
 /// Часть строки кода. Подсветка добавляется при отрисовке.
@@ -45,7 +69,11 @@ pub struct CodeRef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
+    /// Отступы и содержимое.
     pub spans: Vec<Span>,
+    /// Сколько первых фрагментов относится к отступам.
+    pub prefix: usize,
+    pub join: Join,
     pub code: Option<CodeRef>,
     /// Байт исходного текста, которому соответствует начало строки.
     pub src: usize,
@@ -61,7 +89,9 @@ pub struct CodeBlock {
 #[derive(Debug, Default)]
 pub struct Doc {
     pub lines: Vec<Line>,
-    pub links: Vec<String>,
+    pub items: Vec<Item>,
+    /// Выбираемое в порядке показа: номер и первая строка.
+    pub order: Vec<(u32, usize)>,
     pub code: Vec<CodeBlock>,
 }
 
@@ -72,6 +102,13 @@ impl Doc {
             builder.event(event, range);
         }
         builder.finish()
+    }
+
+    /// Код, который показывает строка.
+    pub fn code_text(&self, line: &Line) -> Option<&str> {
+        let code = line.code.as_ref()?;
+        let block = &self.code[code.block as usize];
+        Some(&block.lines[code.line as usize][code.bytes.clone()])
     }
 
     /// Строка просмотра, показывающая байт исходного текста.
@@ -87,6 +124,10 @@ impl Doc {
         {
             line -= 1;
         }
+        // Пустая строка перед блоком относится к его началу.
+        if line + 1 < self.lines.len() && self.lines[line].is_blank() {
+            line += 1;
+        }
         line
     }
 }
@@ -95,6 +136,58 @@ impl Line {
     fn is_blank(&self) -> bool {
         self.code.is_none() && self.spans.iter().all(|s| s.text.trim().is_empty())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heading {
+    pub level: usize,
+    pub text: String,
+    pub src: usize,
+    /// Имя для ссылок, повторы с номером.
+    pub slug: String,
+}
+
+/// Заголовки документа по порядку.
+pub fn headings(text: &str) -> Vec<Heading> {
+    let mut out: Vec<Heading> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut open: Option<Heading> = None;
+    for (event, range) in Parser::new_ext(text, options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                open = Some(Heading {
+                    level: level as usize,
+                    text: String::new(),
+                    src: range.start,
+                    slug: String::new(),
+                });
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some(mut heading) = open.take() {
+                    let slug = links::slug(&heading.text);
+                    let count = seen.entry(slug.clone()).or_insert(0);
+                    heading.slug = match *count {
+                        0 => slug,
+                        n => format!("{slug}-{n}"),
+                    };
+                    *count += 1;
+                    out.push(heading);
+                }
+            }
+            Event::Text(t) | Event::Code(t) | Event::InlineMath(t) => {
+                if let Some(heading) = &mut open {
+                    heading.text.push_str(&t);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some(heading) = &mut open {
+                    heading.text.push(' ');
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn options() -> Options {
@@ -114,6 +207,8 @@ struct Prefix {
     mark: Mark,
     width: usize,
     used: bool,
+    /// Чекбокс в первой строке.
+    item: Option<u32>,
 }
 
 struct List {
@@ -131,7 +226,7 @@ struct Builder {
     lists: Vec<List>,
     inline: Inline,
     marks: Vec<Mark>,
-    link: Option<u32>,
+    item: Option<u32>,
     images: Vec<String>,
     need_blank: bool,
     table: Option<Table>,
@@ -154,7 +249,7 @@ impl Builder {
             lists: Vec::new(),
             inline: Inline::default(),
             marks: Vec::new(),
-            link: None,
+            item: None,
             images: Vec::new(),
             need_blank: false,
             table: None,
@@ -172,6 +267,14 @@ impl Builder {
         for line in &mut self.doc.lines {
             last = line.src.max(last);
             line.src = last;
+        }
+        let mut seen = vec![false; self.doc.items.len()];
+        for (number, line) in self.doc.lines.iter().enumerate() {
+            for item in line.spans.iter().filter_map(|s| s.item) {
+                if !std::mem::replace(&mut seen[item as usize], true) {
+                    self.doc.order.push((item, number));
+                }
+            }
         }
         self.doc
     }
@@ -213,7 +316,7 @@ impl Builder {
                 self.emit(vec![Span::new(rule, Mark::tone(Tone::Dim))], range.start);
                 self.need_blank = true;
             }
-            Event::TaskListMarker(done) => self.task(done),
+            Event::TaskListMarker(done) => self.task(done, range.start),
         }
     }
 
@@ -289,7 +392,7 @@ impl Builder {
             Tag::Strong => self.marks.push(Mark::TEXT.bold()),
             Tag::Strikethrough => self.marks.push(Mark::TEXT.strike()),
             Tag::Link { dest_url, .. } => {
-                self.link = Some(self.add_link(dest_url.into_string()));
+                self.item = Some(self.add_item(Item::Link(dest_url.into_string())));
                 self.marks.push(Mark::tone(Tone::Link).underline());
             }
             Tag::Image { dest_url, .. } => {
@@ -358,7 +461,7 @@ impl Builder {
             }
             TagEnd::TableCell => {
                 let mut cell = std::mem::take(&mut self.inline);
-                cell.find_links(&mut self.doc.links);
+                cell.find_links(&mut self.doc.items);
                 if let Some(table) = &mut self.table {
                     table.push_cell(cell);
                 }
@@ -368,7 +471,7 @@ impl Builder {
             }
             TagEnd::Link => {
                 self.marks.pop();
-                self.link = None;
+                self.item = None;
             }
             TagEnd::Image => {
                 if let Some(dest) = self.images.pop() {
@@ -385,12 +488,12 @@ impl Builder {
 
     fn push(&mut self, text: &str, mark: Mark, src: usize) {
         let outer = self.marks.iter().fold(Mark::TEXT, |a, b| a.with(*b));
-        self.inline.push(text, outer.with(mark), self.link, src);
+        self.inline.push(text, outer.with(mark), self.item, src);
     }
 
-    fn add_link(&mut self, url: String) -> u32 {
-        self.doc.links.push(url);
-        self.doc.links.len() as u32 - 1
+    fn add_item(&mut self, item: Item) -> u32 {
+        self.doc.items.push(item);
+        self.doc.items.len() as u32 - 1
     }
 
     /// Выводит накопленный абзац.
@@ -399,9 +502,9 @@ impl Builder {
             return;
         }
         let mut inline = std::mem::take(&mut self.inline);
-        inline.find_links(&mut self.doc.links);
-        for (spans, src) in inline.wrap(self.available(), self.tab) {
-            self.emit(spans, src);
+        inline.find_links(&mut self.doc.items);
+        for (spans, src, join) in inline.wrap(self.available(), self.tab) {
+            self.emit_joined(spans, src, join);
         }
     }
 
@@ -422,7 +525,9 @@ impl Builder {
                 spans.push(Span::new(p.rest.clone(), p.mark));
             }
             self.doc.lines.push(Line {
+                prefix: spans.len(),
                 spans,
+                join: Join::New,
                 code: None,
                 src,
             });
@@ -444,6 +549,7 @@ impl Builder {
             mark,
             width,
             used: false,
+            item: None,
         });
     }
 
@@ -475,12 +581,17 @@ impl Builder {
         }
     }
 
-    fn task(&mut self, done: bool) {
+    fn task(&mut self, done: bool, src: usize) {
         let box_ = if done { "☑ " } else { "☐ " };
         let numbered = self.lists.last().is_some_and(|l| l.next.is_some());
-        let Some(p) = self.prefixes.last_mut().filter(|p| !p.used) else {
+        if self.prefixes.last().is_none_or(|p| p.used) {
+            return;
+        }
+        let item = self.add_item(Item::Task { src, done });
+        let Some(p) = self.prefixes.last_mut() else {
             return;
         };
+        p.item = Some(item);
         if numbered {
             p.first.push_str(box_);
         } else {
@@ -502,17 +613,28 @@ impl Builder {
             }
             used += p.width;
             let text = if p.used { &p.rest } else { &p.first };
+            let mut span = Span::new(text.clone(), p.mark);
+            if !p.used {
+                span.item = p.item;
+            }
             p.used = true;
-            spans.push(Span::new(text.clone(), p.mark));
+            spans.push(span);
         }
         spans
     }
 
     fn emit(&mut self, spans: Vec<Span>, src: usize) {
+        self.emit_joined(spans, src, Join::New);
+    }
+
+    fn emit_joined(&mut self, spans: Vec<Span>, src: usize, join: Join) {
         let mut all = self.prefix_spans();
+        let prefix = all.len();
         all.extend(spans);
         self.doc.lines.push(Line {
             spans: all,
+            prefix,
+            join,
             code: None,
             src,
         });
@@ -526,8 +648,9 @@ impl Builder {
             let text = line.trim_end_matches(['\r', '\n']);
             inline.push(text, Mark::tone(Tone::Html), None, src);
             src += line.len();
-            for (spans, src) in std::mem::take(&mut inline).wrap(self.available(), self.tab) {
-                self.emit(spans, src);
+            let lines = std::mem::take(&mut inline).wrap(self.available(), self.tab);
+            for (spans, src, join) in lines {
+                self.emit_joined(spans, src, join);
             }
         }
     }
@@ -549,11 +672,14 @@ impl Builder {
         let mut src = self.src;
         for (number, line) in raw.lines().enumerate() {
             src += line.len() + 1;
+            let mut join = Join::New;
             for row in layout::rows(line, Some(width), self.tab) {
                 let mut spans = self.prefix_spans();
                 spans.push(Span::new("│ ", dim));
                 self.doc.lines.push(Line {
+                    prefix: spans.len(),
                     spans,
+                    join: std::mem::replace(&mut join, Join::Glue),
                     code: Some(CodeRef {
                         block: index,
                         line: number as u32,

@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use linkify::{LinkFinder, LinkKind};
 
-use super::Span;
+use super::{Item, Join, Span};
 use crate::layout;
 use crate::style::{Mark, Tone};
 
@@ -12,7 +12,7 @@ use crate::style::{Mark, Tone};
 struct Run {
     start: usize,
     mark: Mark,
-    link: Option<u32>,
+    item: Option<u32>,
     src: usize,
 }
 
@@ -28,14 +28,14 @@ impl Inline {
         self.text.is_empty()
     }
 
-    pub fn push(&mut self, text: &str, mark: Mark, link: Option<u32>, src: usize) {
+    pub fn push(&mut self, text: &str, mark: Mark, item: Option<u32>, src: usize) {
         if text.is_empty() {
             return;
         }
         self.runs.push(Run {
             start: self.text.len(),
             mark,
-            link,
+            item,
             src,
         });
         self.text.push_str(text);
@@ -65,7 +65,7 @@ impl Inline {
     }
 
     /// Находит адреса без разметки: http, https, ftp, www и почту.
-    pub fn find_links(&mut self, links: &mut Vec<String>) {
+    pub fn find_links(&mut self, items: &mut Vec<Item>) {
         if !self.text.contains("://") && !self.text.contains("www.") && !self.text.contains('@') {
             return;
         }
@@ -89,24 +89,24 @@ impl Inline {
             let first = self.run_at(link.start());
             let plain = (first..self.runs.len())
                 .take_while(|i| self.runs[*i].start < link.end())
-                .all(|i| self.runs[i].link.is_none() && self.runs[i].mark.tone != Tone::Code);
+                .all(|i| self.runs[i].item.is_none() && self.runs[i].mark.tone != Tone::Code);
             if plain {
                 found.push((link.start()..link.end(), target));
             }
         }
         // С конца, чтобы номера фрагментов слева не сдвигались.
         for (range, target) in found.into_iter().rev() {
-            links.push(target);
-            self.set_link(range, links.len() as u32 - 1);
+            items.push(Item::Link(target));
+            self.set_item(range, items.len() as u32 - 1);
         }
     }
 
-    fn set_link(&mut self, range: Range<usize>, link: u32) {
+    fn set_item(&mut self, range: Range<usize>, item: u32) {
         self.split(range.end);
         self.split(range.start);
         for run in &mut self.runs {
             if range.contains(&run.start) {
-                run.link = Some(link);
+                run.item = Some(item);
                 run.mark = run.mark.with(Mark::tone(Tone::Link).underline());
             }
         }
@@ -140,15 +140,23 @@ impl Inline {
         words.map(|w| layout::width(w, tab)).max().unwrap_or(0)
     }
 
-    /// Строки не шире `width` и место каждой в исходном тексте.
-    pub fn wrap(&self, width: usize, tab: usize) -> Vec<(Vec<Span>, usize)> {
+    /// Строки не шире `width`, место каждой в исходном тексте и связь с предыдущей.
+    pub fn wrap(&self, width: usize, tab: usize) -> Vec<(Vec<Span>, usize, Join)> {
         let mut out = Vec::new();
         let mut base = 0;
         for segment in self.text.split('\n') {
+            let mut join = Join::New;
             for row in layout::rows(segment, Some(width), tab) {
-                let text = segment[row.byte_start..row.byte_end].trim_end_matches(' ');
+                let whole = &segment[row.byte_start..row.byte_end];
+                let text = whole.trim_end_matches(' ');
                 let start = base + row.byte_start;
-                out.push(self.spans(start..start + text.len()));
+                let (spans, src) = self.spans(start..start + text.len());
+                out.push((spans, src, join));
+                join = if text.len() < whole.len() {
+                    Join::Space
+                } else {
+                    Join::Glue
+                };
             }
             base += segment.len() + 1;
         }
@@ -167,12 +175,12 @@ impl Inline {
             let run = self.runs[index];
             let text = &self.text[run.start.max(range.start)..self.run_end(index).min(range.end)];
             match spans.last_mut() {
-                Some(s) if s.mark == run.mark && s.link == run.link => s.text.push_str(text),
+                Some(s) if s.mark == run.mark && s.item == run.item => s.text.push_str(text),
                 _ if text.is_empty() => {}
                 _ => spans.push(Span {
                     text: text.to_owned(),
                     mark: run.mark,
-                    link: run.link,
+                    item: run.item,
                 }),
             }
             index += 1;

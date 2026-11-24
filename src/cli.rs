@@ -12,7 +12,7 @@ use crate::command::Mode;
 use crate::encoding::Enc;
 use crate::i18n::Lang;
 use crate::term::{EventReader, Terminal};
-use crate::{code, diag, ui};
+use crate::{code, diag, links, ui};
 
 /// Как часто обновлять экран, пока идёт фоновая работа.
 const BUSY_REDRAW: Duration = Duration::from_millis(20);
@@ -56,7 +56,11 @@ pub fn run() -> io::Result<()> {
         encoding: args.encoding,
         line: args.line,
     };
-    let mut app = App::open(options, Box::<clipboard::System>::default())?;
+    let mut app = App::open(
+        options,
+        Box::<clipboard::System>::default(),
+        Box::new(links::System),
+    )?;
     std::thread::spawn(code::warm_up);
     let mut terminal = Terminal::enter(true)?;
     let mut reader = EventReader::new();

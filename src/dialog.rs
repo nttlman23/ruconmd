@@ -1,17 +1,59 @@
 //! Запросы к пользователю: строка ввода и список вариантов.
 
+use std::ops::Range;
 use std::path::PathBuf;
 
 use crate::buffer::Eol;
 use crate::encoding::{Enc, Format};
 use crate::key::{Chord, Key};
 
+/// На сколько пунктов сдвигают меню PgUp и PgDn.
+const PAGE: usize = 10;
+
+/// Место, куда ведёт переход.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    /// `None`: документ без имени.
+    pub path: Option<PathBuf>,
+    pub spot: Spot,
+    /// Возврат по истории, а не новый переход.
+    pub back: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Spot {
+    Start,
+    Anchor(String),
+    Src(usize),
+}
+
+/// Что сделать после сохранения или отказа от него.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Then {
+    Stay,
+    Quit,
+    Go(Location),
+}
+
+/// Ход замены. Места измеряются в байтах текста.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Replacing {
+    pub with: String,
+    /// Откуда начали: второй круг останавливается здесь.
+    pub start: usize,
+    pub wrapped: bool,
+    pub hit: Range<usize>,
+    /// Последнее заменённое совпадение было пустым.
+    pub was_empty_hit: bool,
+    pub done: usize,
+}
+
 /// Запись файла, которую можно продолжить после ответа пользователя.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaveJob {
     pub path: PathBuf,
     pub format: Format,
-    pub quit: bool,
+    pub then: Then,
     /// Пользователь согласился записать поверх другого файла.
     pub overwrite: bool,
     /// Пользователь согласился потерять нечитаемые байты исходного файла.
@@ -22,17 +64,22 @@ pub struct SaveJob {
 pub enum Action {
     Cancel,
     Save(SaveJob),
-    SaveAndQuit,
-    QuitWithoutSaving,
+    SaveThen(Then),
+    Discard(Then),
+    /// Показать место исходного текста.
+    GotoSrc(usize),
     Reload(Enc),
     SetFormat(Format),
     SetEol(Eol),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ask {
-    SavePath { quit: bool },
+    SavePath(Then),
     GotoLine,
+    Find,
+    ReplaceFind,
+    ReplaceWith,
 }
 
 #[derive(Debug)]
@@ -55,6 +102,7 @@ pub struct Menu {
 pub enum Dialog {
     Field(Field),
     Menu(Menu),
+    Replace(Replacing),
 }
 
 /// Что получилось после нажатия.
@@ -95,7 +143,7 @@ impl Field {
 
     fn key(&mut self, chord: Chord) -> Outcome {
         match chord.key {
-            Key::Enter => return Outcome::Submit(self.ask, self.text.clone()),
+            Key::Enter => return Outcome::Submit(self.ask.clone(), self.text.clone()),
             Key::Backspace => {
                 let start = self.prev();
                 self.text.replace_range(start..self.cursor, "");
@@ -135,6 +183,8 @@ impl Menu {
             Key::Down | Key::Tab => self.selected = (self.selected + 1) % self.items.len(),
             Key::Home => self.selected = 0,
             Key::End => self.selected = last,
+            Key::PageUp => self.selected = self.selected.saturating_sub(PAGE),
+            Key::PageDown => self.selected = (self.selected + PAGE).min(last),
             Key::Enter => return Outcome::Act(self.items[self.selected].1.clone()),
             _ => {}
         }
@@ -150,6 +200,8 @@ impl Dialog {
         match self {
             Dialog::Field(field) => field.key(chord),
             Dialog::Menu(menu) => menu.key(chord),
+            // Клавиши замены обрабатывает приложение.
+            Dialog::Replace(_) => Outcome::Open,
         }
     }
 }
@@ -185,13 +237,16 @@ mod tests {
     #[test]
     fn menu_wraps_around() {
         let items = vec![
-            ("a".into(), Action::SaveAndQuit),
+            ("a".into(), Action::SetEol(Eol::Lf)),
             ("b".into(), Action::Cancel),
         ];
         let mut d = Dialog::Menu(Menu::new("", items));
         press(&mut d, "up");
         assert_eq!(press(&mut d, "enter"), Outcome::Act(Action::Cancel));
         press(&mut d, "down");
-        assert_eq!(press(&mut d, "enter"), Outcome::Act(Action::SaveAndQuit));
+        assert_eq!(
+            press(&mut d, "enter"),
+            Outcome::Act(Action::SetEol(Eol::Lf))
+        );
     }
 }

@@ -355,12 +355,16 @@ impl Buffer {
         self.insert(text, Kind::Paste, continued);
     }
 
-    fn insert(&mut self, text: &str, kind: Kind, continued: bool) {
+    fn with_document_eol(&self, text: &str) -> String {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let text = match self.ends.eol {
+        match self.ends.eol {
             Eol::Lf => text,
             Eol::Crlf => text.replace('\n', "\r\n"),
-        };
+        }
+    }
+
+    fn insert(&mut self, text: &str, kind: Kind, continued: bool) {
+        let text = self.with_document_eol(text);
         let range = self.selection().unwrap_or(self.cursor..self.cursor);
         self.replace(range, text, kind, continued);
     }
@@ -395,6 +399,62 @@ impl Buffer {
         if !range.is_empty() {
             self.replace(range, String::new(), Kind::Other, false);
         }
+    }
+
+    /// Заменяет диапазон одним шагом отмены. Место курсора и начала выделения
+    /// задаётся в новом тексте, без него курсор встаёт за вставленным.
+    pub fn edit(&mut self, range: Range<usize>, text: &str, place: Option<(Option<usize>, usize)>) {
+        let text = self.with_document_eol(text);
+        self.replace(range, text, Kind::Other, false);
+        if let Some((anchor, cursor)) = place {
+            self.anchor = anchor.map(|a| a.min(self.len()));
+            self.cursor = cursor.min(self.len());
+            let after = self.state();
+            self.undo.last_mut().expect("replace added a step").after = after;
+        }
+        self.sealed = true;
+    }
+
+    /// Меняет строки одним шагом. Курсор и выделение сдвигаются вместе с текстом.
+    pub fn edit_lines(&mut self, lines: Range<usize>, change: impl Fn(&str) -> String) {
+        let first = self.line_start(lines.start);
+        let last = self.line_end(lines.end - 1);
+        let mut out = String::new();
+        // Начало строки, её новое начало и сдвиг текста в ней.
+        let mut shifts = Vec::new();
+        let mut written = 0;
+        for line in lines {
+            let start = self.line_start(line);
+            let old = self.line(line);
+            let new = change(&old);
+            let shift = char_count(&new) as isize - char_count(&old) as isize;
+            shifts.push((start, first + written, shift));
+            let end = self.line_end(line);
+            let eol = if end < last {
+                self.slice(end..self.line_start(line + 1))
+            } else {
+                String::new()
+            };
+            written += char_count(&new) + char_count(&eol);
+            out.push_str(&new);
+            out.push_str(&eol);
+        }
+        if out == self.slice(first..last) {
+            return;
+        }
+        let grown = written as isize - (last - first) as isize;
+        let moved = |pos: usize| match shifts.iter().rev().find(|(start, ..)| *start <= pos) {
+            None => pos,
+            Some(_) if pos > last => pos.saturating_add_signed(grown),
+            Some((start, new, shift)) => new + (pos - start).saturating_add_signed(*shift),
+        };
+        let place = (self.anchor.map(moved), moved(self.cursor));
+        // Переводы строк взяты из документа, приводить их не надо.
+        self.replace(first..last, out, Kind::Other, false);
+        (self.anchor, self.cursor) = place;
+        let after = self.state();
+        self.undo.last_mut().expect("replace added a step").after = after;
+        self.sealed = true;
     }
 
     /// Приводит все переводы строк к одному виду, отменяется одним шагом.
@@ -736,6 +796,37 @@ mod tests {
         b.delete_word_back();
         assert!(!b.is_modified());
         assert_eq!(b.line(0), "");
+    }
+
+    #[test]
+    fn edit_places_the_cursor_and_is_one_step() {
+        let mut b = Buffer::new("один два");
+        b.move_to(4, false);
+        b.edit(0..4, "**один**", Some((Some(2), 6)));
+        assert_eq!(b.selected_text().unwrap(), "один");
+        b.undo();
+        assert_eq!((b.text().as_str(), b.cursor()), ("один два", 4));
+        b.redo();
+        assert_eq!(b.selected_text().unwrap(), "один");
+    }
+
+    #[test]
+    fn edit_lines_moves_the_selection_with_text() {
+        let mut b = Buffer::new("x\r\naa\nbb\ncc");
+        b.move_to(4, false);
+        b.move_to(8, true);
+        assert_eq!(b.selected_text().unwrap(), "a\nbb");
+        b.edit_lines(1..3, |l| format!("  {l}"));
+        assert_eq!(b.text(), "x\r\n  aa\n  bb\ncc");
+        assert_eq!(b.selected_text().unwrap(), "a\n  bb");
+        b.edit_lines(1..3, |l| l.trim_start().to_owned());
+        assert_eq!(b.selected_text().unwrap(), "a\nbb");
+        b.undo();
+        b.undo();
+        assert_eq!(b.text(), "x\r\naa\nbb\ncc");
+        assert!(!b.is_modified());
+        b.edit_lines(0..1, str::to_owned);
+        assert!(!b.is_modified(), "no change, no step");
     }
 
     /// Случайные правки: полная отмена возвращает исходный текст, полный повтор конечный.

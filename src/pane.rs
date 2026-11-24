@@ -1,5 +1,6 @@
 //! Область просмотра: построение в фоне, прокрутка, связь с местом в тексте.
 
+use std::ops::Range;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
 
@@ -7,9 +8,13 @@ use ropey::Rope;
 
 use crate::buffer::Buffer;
 use crate::code::Highlighter;
-use crate::preview::{Doc, Line};
+use crate::layout;
+use crate::preview::{Doc, Item, Join, Line};
+use crate::search::{Query, Search};
 use crate::style::Mark;
 
+/// Поле слева от просмотра.
+pub const MARGIN: u16 = 1;
 /// Тексты до этого размера строятся сразу, без мигания экрана.
 const SYNC_BYTES: usize = 256 * 1024;
 
@@ -39,6 +44,80 @@ pub struct Pane {
     anchor: Option<Anchor>,
     /// Пользователь прокручивал просмотр.
     scrolled: bool,
+    /// Выбранная ссылка или чекбокс, номер в [`Doc::order`].
+    selected: Option<usize>,
+    found: Option<Found>,
+    /// Куда был переход, пока пользователь не прокрутил дальше.
+    focus: Option<usize>,
+}
+
+/// Кусок текста поиска: откуда он в просмотре.
+struct Piece {
+    /// Начало в тексте поиска.
+    start: usize,
+    line: usize,
+    /// Начало в строке просмотра, после отступов.
+    offset: usize,
+}
+
+/// Результат поиска по просмотру.
+struct Found {
+    query: Query,
+    pieces: Vec<Piece>,
+    hits: Vec<Range<usize>>,
+    current: Option<usize>,
+}
+
+impl Found {
+    fn new(doc: &Doc, search: &Search) -> Self {
+        let mut text = String::new();
+        let mut pieces = Vec::with_capacity(doc.lines.len());
+        for (number, line) in doc.lines.iter().enumerate() {
+            text.push_str(match line.join {
+                Join::New => "\n",
+                Join::Space => " ",
+                Join::Glue => "",
+            });
+            let (prefix, content) = line.spans.split_at(line.prefix);
+            pieces.push(Piece {
+                start: text.len(),
+                line: number,
+                offset: prefix.iter().map(|s| s.text.len()).sum(),
+            });
+            text.extend(content.iter().map(|s| s.text.as_str()));
+            text.push_str(doc.code_text(line).unwrap_or_default());
+        }
+        Self {
+            query: search.query.clone(),
+            // Пустые совпадения показать нельзя.
+            hits: search.matches(&text).filter(|h| !h.is_empty()).collect(),
+            pieces,
+            current: None,
+        }
+    }
+
+    fn line_of(&self, hit: usize) -> usize {
+        let start = self.hits[hit].start;
+        let piece = self.pieces.partition_point(|p| p.start <= start);
+        self.pieces[piece.saturating_sub(1)].line
+    }
+
+    /// Байты строки просмотра, попавшие в совпадения, и признак текущего.
+    fn in_line(&self, line: usize) -> Vec<(Range<usize>, bool)> {
+        let Some(piece) = self.pieces.get(line) else {
+            return Vec::new();
+        };
+        let end = self.pieces.get(line + 1).map_or(usize::MAX, |p| p.start);
+        let first = self.hits.partition_point(|h| h.end <= piece.start);
+        let hits = self.hits[first..].iter().enumerate();
+        hits.take_while(|(_, h)| h.start < end)
+            .map(|(i, h)| {
+                let from = h.start.max(piece.start) - piece.start + piece.offset;
+                let to = h.end.min(end) - piece.start + piece.offset;
+                (from..to, self.current == Some(first + i))
+            })
+            .collect()
+    }
 }
 
 impl Default for Pane {
@@ -54,6 +133,9 @@ impl Default for Pane {
             height: 1,
             anchor: None,
             scrolled: false,
+            selected: None,
+            found: None,
+            focus: None,
         }
     }
 }
@@ -72,6 +154,7 @@ impl Pane {
     pub fn show(&mut self, src: usize, row: usize) {
         self.anchor = Some(Anchor { src, row });
         self.scrolled = false;
+        self.focus = None;
         self.apply_anchor();
     }
 
@@ -116,14 +199,148 @@ impl Pane {
     }
 
     fn accept(&mut self, key: Key, doc: Doc) {
+        // После отметки чекбокса строки те же, ничего не должно сдвинуться.
+        let same_shape = self.shown.is_some_and(|k| k.width == key.width)
+            && self.doc.lines.len() == doc.lines.len()
+            && self.doc.order.len() == doc.order.len();
+        if !same_shape {
+            self.selected = None;
+        }
+        self.found = None;
         // После смены ширины сверху остаётся тот же текст.
-        if self.anchor.is_none() && self.shown.is_some() {
+        if self.anchor.is_none() && self.shown.is_some() && !same_shape {
             let src = self.source_at_top();
             self.anchor = Some(Anchor { src, row: 0 });
         }
         self.doc = doc;
         self.shown = Some(key);
         self.code = Highlighter::default();
+    }
+
+    /// Переход к месту по желанию пользователя: редактор потом последует за ним.
+    pub fn jump(&mut self, src: usize) {
+        self.show(src, 0);
+        self.scrolled = true;
+        self.selected = None;
+        self.focus = Some(src);
+    }
+
+    pub fn focus(&self) -> Option<usize> {
+        self.focus
+    }
+
+    // --- Выбор ---
+
+    /// Выбирает следующую или предыдущую ссылку. `false`: выбирать нечего.
+    pub fn select(&mut self, forward: bool) -> bool {
+        let count = self.doc.order.len();
+        if count == 0 {
+            return false;
+        }
+        let bottom = self.top + self.height;
+        let visible = |line: usize| (self.top..bottom).contains(&line);
+        let selected = self.selected.filter(|s| visible(self.doc.order[*s].1));
+        let next = match (selected, forward) {
+            (Some(s), true) => (s + 1) % count,
+            (Some(s), false) => (s + count - 1) % count,
+            // Начинаем с того, что на экране.
+            (None, true) => self.doc.order.partition_point(|(_, l)| *l < self.top) % count,
+            (None, false) => {
+                let after = self.doc.order.partition_point(|(_, l)| *l < bottom);
+                (after + count - 1) % count
+            }
+        };
+        self.selected = Some(next);
+        self.reveal(self.doc.order[next].1);
+        true
+    }
+
+    /// Выбирает ссылку или чекбокс под ячейкой области.
+    pub fn select_at(&mut self, x: usize, y: usize) -> bool {
+        if !self.is_ready() {
+            return false;
+        }
+        let Some(line) = self.visible().get(y) else {
+            return false;
+        };
+        let mut column = MARGIN as usize;
+        let mut item = None;
+        for span in &line.spans {
+            let end = column + layout::width(&span.text, 4);
+            if (column..end).contains(&x) {
+                item = span.item;
+            }
+            column = end;
+        }
+        let Some(item) = item else { return false };
+        self.selected = self.doc.order.iter().position(|(i, _)| *i == item);
+        self.selected.is_some()
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected = None;
+    }
+
+    pub fn selected_item(&self) -> Option<&Item> {
+        self.selected_id().map(|id| &self.doc.items[id as usize])
+    }
+
+    /// Номер выбранного в [`Doc::items`].
+    pub fn selected_id(&self) -> Option<u32> {
+        let selected = self.selected.filter(|_| self.is_ready())?;
+        self.doc.order.get(selected).map(|(id, _)| *id)
+    }
+
+    fn reveal(&mut self, line: usize) {
+        if !(self.top..self.top + self.height).contains(&line) {
+            self.set_top(line.saturating_sub(self.height / 2));
+        }
+    }
+
+    // --- Поиск ---
+
+    /// Обновляет совпадения, если изменился запрос или документ.
+    pub fn set_search(&mut self, search: Option<&Search>) {
+        match search {
+            None => self.found = None,
+            Some(search) => {
+                let known = self.found.as_ref().map(|f| &f.query);
+                if known != Some(&search.query) && self.is_ready() {
+                    self.found = Some(Found::new(&self.doc, search));
+                }
+            }
+        }
+    }
+
+    /// Переходит к совпадению: его номер, число всех и был ли переход по кругу.
+    pub fn find(&mut self, forward: bool) -> Option<(usize, usize, bool)> {
+        let found = self.found.as_ref()?;
+        let count = found.hits.len();
+        if count == 0 {
+            return None;
+        }
+        let first_visible = || {
+            let byte = found.pieces.get(self.top).map_or(0, |p| p.start);
+            found.hits.partition_point(|h| h.start < byte)
+        };
+        let (index, wrapped) = match (found.current, forward) {
+            (Some(c), true) => ((c + 1) % count, c + 1 == count),
+            (Some(c), false) => ((c + count - 1) % count, c == 0),
+            (None, true) => (first_visible() % count, first_visible() == count),
+            (None, false) => ((first_visible() + count - 1) % count, first_visible() == 0),
+        };
+        let line = found.line_of(index);
+        if let Some(found) = &mut self.found {
+            found.current = Some(index);
+        }
+        self.reveal(line);
+        Some((index + 1, count, wrapped))
+    }
+
+    /// Совпадения в видимой строке: байты и признак текущего.
+    pub fn hits(&self, row: usize) -> Vec<(Range<usize>, bool)> {
+        let found = self.found.as_ref();
+        found.map_or(Vec::new(), |f| f.in_line(self.top + row))
     }
 
     fn apply_anchor(&mut self) {
@@ -178,7 +395,10 @@ impl Pane {
         let before = self.top;
         self.top = top;
         self.clamp();
-        self.scrolled |= self.top != before;
+        if self.top != before {
+            self.scrolled = true;
+            self.focus = None;
+        }
     }
 
     pub fn visible(&self) -> &[Line] {
@@ -202,11 +422,8 @@ impl Pane {
         }
     }
 
-    /// Текст и оформление видимой части строки кода.
     pub fn code_text(&self, line: &Line) -> Option<&str> {
-        let code = line.code.as_ref()?;
-        let block = &self.doc.code[code.block as usize];
-        Some(&block.lines[code.line as usize][code.bytes.clone()])
+        self.doc.code_text(line)
     }
 
     pub fn code_mark(&self, line: &Line, byte: usize) -> Mark {

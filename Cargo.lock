@@ -1593,6 +1593,7 @@ dependencies = [
  "linkify",
  "pulldown-cmark",
  "ratatui",
+ "regex",
  "ropey",
  "syntect",
  "sys-locale",
