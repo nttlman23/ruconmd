@@ -54,7 +54,7 @@ add_path() {
         if [ -f "$HOME/.bash_profile" ]; then profile=$HOME/.bash_profile; fi ;;
     esac
     if ! grep -qF "$MARK" "$profile" 2>/dev/null; then
-        printf '\nexport PATH="%s:$PATH" %s\n' "$dir" "$MARK" >>"$profile"
+        printf '\nexport PATH="%s:%s" %s\n' "$dir" "\$PATH" "$MARK" >>"$profile"
     fi
     say "Added $dir to PATH in $profile, log in again to use it."
 }

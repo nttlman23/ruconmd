@@ -18,18 +18,19 @@ function Refuses([string]$Title, [hashtable]$Options) {
 function Raw-Path { [string](Get-Item 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames') }
 function Entries { @((Raw-Path) -split ';' | Where-Object { $_ -eq $dir }).Count }
 
-# A release made of the program given by the build, or of any small program.
+# A release made of a system program that understands --version.
 function Release([string]$Version) {
     $name = "ruconmd-v$Version-windows-x86_64"
     $folder = Join-Path $dist $name
     New-Item -ItemType Directory -Path $folder | Out-Null
-    Copy-Item "$env:SystemRoot\System32\whoami.exe" (Join-Path $folder 'ruconmd.exe')
+    Copy-Item "$env:SystemRoot\System32\curl.exe" (Join-Path $folder 'ruconmd.exe')
     Set-Content -LiteralPath (Join-Path $folder 'LICENSE-MIT') -Value $Version
     Compress-Archive -Path $folder -DestinationPath "$folder.zip"
     $hash = (Get-FileHash -LiteralPath "$folder.zip" -Algorithm SHA256).Hash.ToLower()
     Add-Content -LiteralPath (Join-Path $dist 'SHA256SUMS') -Value "$hash  $name.zip"
 }
 
+$failed = $false
 $before = Raw-Path
 $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
 try {
@@ -67,8 +68,17 @@ try {
     & $script -From $dist -Version '1.1.0' -Dir $dir -NoPath
     Check 'PATH is left alone' ((Entries) -eq 0)
     & $script -Uninstall -Dir $dir
+} catch {
+    # GitHub shows such a line in the summary.
+    $text = "$_`n$($_.ScriptStackTrace)" -replace '\r', '' -replace '%', '%25' -replace '\n', '%0A'
+    Write-Host "::error::$text"
+    $failed = $true
 } finally {
     $key.SetValue('Path', $before, 'ExpandString')
     $key.Close()
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# Otherwise the exit code of the last started program would be used.
+if ($failed) { exit 1 }
+exit 0

@@ -1,5 +1,6 @@
 #!/bin/sh
 # Проверяет install.sh в отдельном домашнем каталоге, без сети.
+# Неудача выводится так, чтобы GitHub показал её в сводке.
 # Первый аргумент: оболочка, которой выполнять (sh, dash, bash).
 
 set -eu
@@ -12,11 +13,11 @@ export HOME="$root/home" SHELL=/bin/bash
 unset XDG_DATA_HOME
 mkdir "$HOME" "$root/dist"
 
-check() { eval "$2" || { echo "FAILED: $1" >&2; exit 1; }; echo "ok: $1"; }
+check() { eval "$2" || { echo "::error::FAILED: $1"; exit 1; }; echo "ok: $1"; }
 refuses() {
     title=$1; shift
     if "$shell" "$script" "$@" >"$root/out" 2>&1; then
-        cat "$root/out" >&2; echo "FAILED: $title" >&2; exit 1
+        cat "$root/out"; echo "::error::FAILED: $title"; exit 1
     fi
     echo "ok: $title"
 }
