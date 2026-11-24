@@ -13,42 +13,65 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             bin: ruconmd
-            asset: ruconmd-linux-x86_64
+            platform: linux-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: ruconmd.exe
-            asset: ruconmd-windows-x86_64.exe
+            platform: windows-x86_64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     defaults:
       run:
         shell: bash
+    env:
+      TAG: ${{ github.ref_name }}
+      NAME: ruconmd-${{ github.ref_name }}-${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v6
+      - name: Tag matches the package version
+        run: grep -qx "version = \"${TAG#v}\"" Cargo.toml
       - run: rustup toolchain install stable --profile minimal
       - run: rustup default stable && rustup target add ${{ matrix.target }}
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo test --locked --target ${{ matrix.target }}
       - run: cargo build --locked --release --target ${{ matrix.target }}
-      - run: cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.asset }}
-      - uses: actions/upload-artifact@v4
+      - name: Pack
+        run: |
+          mkdir "$NAME"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$NAME/"
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE config.example.toml "$NAME/"
+          python .github/scripts/third_party.py "${{ matrix.target }}" "$NAME/THIRD-PARTY.txt"
+          "./$NAME/${{ matrix.bin }}" --version
+          if [ "$RUNNER_OS" = Windows ]; then 7z a "$NAME.zip" "$NAME"; else tar czf "$NAME.tar.gz" "$NAME"; fi
+      - uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          name: ${{ matrix.platform }}
+          path: |
+            *.zip
+            *.tar.gz
           if-no-files-found: error
 
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
-      - env:
+      - name: Publish
+        env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          # Раздел этой версии без заголовка.
+          awk -v v="## ${TAG#v}" '$0 == v {on = 1; next} /^## / {on = 0} on' CHANGELOG.md > notes.md
+          test -s notes.md
+          case "$TAG" in *-*) kind=--prerelease ;; *) kind=--latest ;; esac
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag $kind --title "$TAG" --notes-file notes.md
