@@ -106,6 +106,17 @@ impl Home {
         fs::read_dir(dir).map_or(0, Iterator::count)
     }
 
+    /// Есть ли готовая копия. Число файлов этого не скажет: пока копия пишется,
+    /// рядом с блокировкой лежит временный файл.
+    fn has_copy(&self) -> bool {
+        let Ok(entries) = fs::read_dir(self.path("state/ruconmd/recovery")) else {
+            return false;
+        };
+        entries
+            .flatten()
+            .any(|e| e.path().extension().is_some_and(|e| e == "rec"))
+    }
+
     fn start(&self, args: &[&str]) -> Session {
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_ruconmd"));
         command.args(["--lang", "ru"]);
@@ -520,7 +531,7 @@ fn killed_session_is_restored() {
     let path = home.write("a.md", "старое\n");
     let mut s = home.open(&[arg(&path)]);
     s.type_text("правка ");
-    s.wait("копия записана", |_| home.copies() == 2);
+    s.wait("копия записана", |_| home.has_copy());
     s.child.kill().unwrap();
     s.child.wait().unwrap();
     drop(s);
