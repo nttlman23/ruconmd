@@ -19,12 +19,16 @@ ratatui = "0.30.2"
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 regex = "1.13.2"
 ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
+semver = "1.0.28"
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = "0.10.9"
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "regex-fancy"] }
 sys-locale = "0.3.2"
 toml = { version = "1.2.2", default-features = false, features = ["parse", "serde", "std"] }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.3"
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 
 [profile.release]
 lto = "thin"

@@ -65,6 +65,28 @@ jobs:
           rustup toolchain install "$version" --profile minimal
           cargo "+$version" build --locked
 
+  # Скрипты установки, без сети. Windows: обе оболочки.
+  installers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - if: runner.os == 'Linux'
+        run: |
+          shellcheck install.sh
+          sh .github/scripts/test_install.sh dash
+          sh .github/scripts/test_install.sh bash
+      - if: runner.os == 'Windows'
+        shell: powershell
+        run: .github/scripts/test_install.ps1
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: .github/scripts/test_install.ps1
+
   dependencies:
     runs-on: ubuntu-latest
     timeout-minutes: 15

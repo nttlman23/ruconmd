@@ -17,7 +17,7 @@ use crate::graphics::Graphics;
 use crate::i18n::Lang;
 use crate::style::Depth;
 use crate::term::{Events, Terminal};
-use crate::{code, config, diag, graphics, links, ui};
+use crate::{code, config, diag, graphics, links, ui, update};
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -42,6 +42,9 @@ pub struct Args {
     /// Show what the terminal sends for each key and print the log on exit
     #[arg(long, conflicts_with_all = ["file", "view", "line", "encoding"])]
     pub keys: bool,
+    /// Download the latest release from GitHub and replace this program
+    #[arg(long, conflicts_with_all = ["file", "view", "line", "encoding", "keys"])]
+    pub update: bool,
 }
 
 pub fn run() -> io::Result<()> {
@@ -49,6 +52,10 @@ pub fn run() -> io::Result<()> {
     let (config, warnings) = config::load(args.config.as_deref());
     let config = config.fitted(Depth::from_system());
     let lang = args.lang.or(config.lang).unwrap_or_else(Lang::from_system);
+    if args.update {
+        return update::run(lang);
+    }
+    update::remove_old();
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::other(lang.strings().not_a_terminal));
     }
@@ -190,6 +197,16 @@ mod tests {
         drop(app);
         let found = recovery::search(&dir.join("state"), Some(&dir.join("a.md")));
         found.orphan.map(|o| o.text)
+    }
+
+    #[test]
+    fn update_is_a_command_of_its_own() {
+        let parse = |args: &[&str]| Args::try_parse_from([&["ruconmd"], args].concat());
+        assert!(parse(&["--update"]).unwrap().update);
+        assert!(!parse(&["a.md"]).unwrap().update);
+        for other in ["a.md", "--view", "--line=1", "--encoding=cp866", "--keys"] {
+            assert!(parse(&["--update", other]).is_err(), "{other}");
+        }
     }
 
     #[test]

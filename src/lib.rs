@@ -31,4 +31,5 @@ pub mod term;
 pub mod tex;
 pub mod typing;
 pub mod ui;
+pub mod update;
 pub mod view;

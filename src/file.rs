@@ -98,6 +98,23 @@ pub fn write_private(path: &Path, temp: &Path, bytes: &[u8]) -> io::Result<()> {
     fill(file, temp, path, bytes, |_| Ok(()))
 }
 
+/// Записывает содержимое рядом с `path` с правами этого файла. Возвращает путь к
+/// записанному.
+pub fn write_beside(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    let meta = fs::metadata(path)?;
+    let (mut file, temp) = create_temp(path, true)?;
+    let result = file
+        .set_permissions(meta.permissions())
+        .and_then(|()| file.write_all(bytes))
+        .and_then(|()| file.sync_all());
+    if let Err(e) = result {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(e);
+    }
+    Ok(temp)
+}
+
 /// Готовит временный файл, записывает его и ставит на место `path`.
 fn fill(
     mut file: File,

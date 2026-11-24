@@ -14,10 +14,12 @@ jobs:
             target: x86_64-unknown-linux-musl
             bin: ruconmd
             platform: linux-x86_64
+            update: bin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: ruconmd.exe
             platform: windows-x86_64
+            update: exe
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     defaults:
@@ -43,6 +45,8 @@ jobs:
           cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE config.example.toml "$NAME/"
           python .github/scripts/third_party.py "${{ matrix.target }}" "$NAME/THIRD-PARTY.txt"
           "./$NAME/${{ matrix.bin }}" --version
+          # Этот файл загружает программа, когда обновляется.
+          cp "$NAME/${{ matrix.bin }}" "$NAME.${{ matrix.update }}"
           if [ "$RUNNER_OS" = Windows ]; then 7z a "$NAME.zip" "$NAME"; else tar czf "$NAME.tar.gz" "$NAME"; fi
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -50,6 +54,7 @@ jobs:
           path: |
             *.zip
             *.tar.gz
+            ruconmd-v*-x86_64.${{ matrix.update }}
           if-no-files-found: error
 
   publish:
@@ -69,6 +74,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
+          cp install.sh install.ps1 dist/
           (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
           # Раздел этой версии без заголовка.
           awk -v v="## ${TAG#v}" '$0 == v {on = 1; next} /^## / {on = 0} on' CHANGELOG.md > notes.md
