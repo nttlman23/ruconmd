@@ -262,6 +262,16 @@ impl App {
         (line + 1, cursor - self.buffer.line_start(line) + 1)
     }
 
+    /// Почему просмотр ещё не показан.
+    pub fn preview_note(&self) -> &'static str {
+        let s = self.lang.strings();
+        if self.pane.is_failed() {
+            s.preview_failed
+        } else {
+            s.preparing
+        }
+    }
+
     /// Вызывается перед отрисовкой: область текста и положение курсора в ней.
     pub fn prepare(&mut self, area: TextArea) {
         self.area = area;
@@ -831,9 +841,16 @@ impl App {
         }
     }
 
+    /// Ведёт ли путь к открытому файлу. Один файл можно записать по-разному:
+    /// `a.md`, `./a.md`, символическая ссылка.
+    fn is_own_file(&self, path: &Path) -> bool {
+        let Some(own) = &self.path else { return false };
+        own == path || matches!((own.canonicalize(), path.canonicalize()), (Ok(a), Ok(b)) if a == b)
+    }
+
     fn write(&mut self, job: SaveJob) {
         let s = self.lang.strings();
-        let same = self.path.as_ref() == Some(&job.path);
+        let same = self.is_own_file(&job.path);
         if !same && !job.overwrite && job.path.symlink_metadata().is_ok() {
             let title = format!("{}: {}", job.path.display(), s.ask_overwrite);
             let yes = SaveJob {
@@ -1547,6 +1564,47 @@ mod tests {
         assert!(app.dialog.is_none());
     }
 
+    const MIXED: &str = "cat\r\none\ntwo\r\nlone\rcr\ncat\n";
+
+    #[test]
+    fn replacing_all_keeps_mixed_line_ends() {
+        let mut app = with_text(MIXED);
+        search_for(&mut app, "ctrl+r", "cat");
+        type_in(&mut app, "dog");
+        press(&mut app, "enter");
+        app.handle(Input::Key(Chord::plain(Key::Char('a'))));
+        assert_eq!(app.buffer.text(), MIXED.replace("cat", "dog"));
+        press(&mut app, "ctrl+z");
+        assert_eq!(app.buffer.text(), MIXED);
+    }
+
+    #[test]
+    fn replacing_one_keeps_line_ends_of_groups() {
+        let mut app = with_text("a\r\nb\nc\n");
+        press(&mut app, "ctrl+r alt+r");
+        type_in(&mut app, "(a\\s+b)");
+        press(&mut app, "enter");
+        type_in(&mut app, "<$1>\\n");
+        press(&mut app, "enter enter");
+        // Группа как в документе, новый перевод строки как у большинства.
+        assert_eq!(app.buffer.text(), "<a\r\nb>\n\nc\n");
+    }
+
+    #[test]
+    fn markup_keeps_mixed_line_ends_of_the_selection() {
+        for (keys, new) in [
+            ("ctrl+b", format!("**{}**\n", MIXED.trim())),
+            ("ctrl+b ctrl+b", MIXED.to_owned()),
+            ("alt+i", format!("*{}*\n", MIXED.trim())),
+            ("ctrl+k", format!("[{MIXED}]()")),
+        ] {
+            let mut app = with_text(MIXED);
+            press(&mut app, "ctrl+a");
+            press(&mut app, keys);
+            assert_eq!(app.buffer.text(), new, "{keys}");
+        }
+    }
+
     #[test]
     fn replace_reports_nothing_found() {
         let mut app = with_text("a");
@@ -1904,6 +1962,54 @@ mod tests {
         assert_eq!(s.disk(), "моё а\n");
         let backup = s.dir.path().join("a.md.bak");
         assert_eq!(fs::read_to_string(backup).unwrap(), "чужое, длиннее\n");
+    }
+
+    #[test]
+    fn another_spelling_of_the_path_does_not_skip_checks() {
+        let mut s = Session::new("а\n");
+        let root = s.dir.path().to_owned();
+        fs::create_dir(root.join("sub")).unwrap();
+        let aliases = [
+            root.join("sub").join("..").join("a.md"),
+            #[cfg(unix)]
+            root.join("link.md"),
+        ];
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&s.path, root.join("link.md")).unwrap();
+        for alias in aliases {
+            fs::write(&s.path, "а\n").unwrap();
+            let mut app = s.open();
+            type_in(&mut app, "x");
+            fs::write(&s.path, "чужое, длиннее\n").unwrap();
+            let alias = alias.to_str().unwrap();
+            app.submit(Ask::SavePath(Then::Stay), alias.into());
+            assert_eq!(
+                menu_title(&app),
+                Lang::En.strings().changed_on_disk,
+                "{alias}"
+            );
+            assert_eq!(s.disk(), "чужое, длиннее\n");
+            app.finish();
+
+            // Повреждённый файл тоже не записывается без вопроса.
+            fs::write(&s.path, b"\xef\xbb\xbfabc\xff").unwrap();
+            let mut app = s.open();
+            type_in(&mut app, "x");
+            app.submit(Ask::SavePath(Then::Stay), alias.into());
+            assert_eq!(menu_title(&app), Lang::En.strings().ask_lossy, "{alias}");
+            app.finish();
+
+            // Когда спрашивать не о чем, файл просто сохраняется.
+            fs::write(&s.path, "а\n").unwrap();
+            let mut app = s.open();
+            type_in(&mut app, "x");
+            app.submit(Ask::SavePath(Then::Stay), alias.into());
+            assert!(app.dialog.is_none() && !app.is_modified(), "{alias}");
+            assert_eq!(s.disk(), "xа\n");
+            s.pass(&mut app, 3);
+            assert!(app.dialog.is_none(), "own save is not a foreign change");
+            app.finish();
+        }
     }
 
     #[test]

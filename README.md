@@ -18,7 +18,7 @@
 
 ## Сборка
 
-Нужен Rust 1.89 или новее.
+Нужен Rust 1.90 или новее.
 
 ```
 cargo build --release
@@ -75,6 +75,7 @@ ruconmd --keys                   показать, что передаёт те�
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+cargo deny check
 ```
 
 `tests/terminal.rs` запускает собранную программу в псевдотерминале. Что проверять руками: [docs/manual-check.md](docs/manual-check.md). Требования и решения: [SPEC.md](SPEC.md).

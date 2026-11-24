@@ -1,9 +1,10 @@
 //! Состояние терминала и чтение событий.
 
-use std::io::{self, Stdout, stdout};
-use std::sync::Once;
+use std::io::{self, Stdout, Write, stderr, stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::{Mutex, Once, PoisonError};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
@@ -24,6 +25,11 @@ use crate::input::{Input, InputDecoder, Platform};
 static ENHANCED: AtomicBool = AtomicBool::new(false);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK: Once = Once::new();
+/// Поток, который рисует. Паника в остальных программу не завершает.
+static OWNER: Mutex<Option<ThreadId>> = Mutex::new(None);
+/// Сообщения о панике в остальных потоках, выводятся по выходе.
+static REPORTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+const MAX_REPORTS: usize = 10;
 
 /// Терминал в режиме программы. Исходное состояние возвращается при
 /// уничтожении значения и при панике.
@@ -36,10 +42,16 @@ impl Terminal {
         PANIC_HOOK.call_once(|| {
             let default = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
+                if ACTIVE.load(Ordering::SeqCst) && !is_owner() {
+                    // Вывод сейчас испортил бы экран.
+                    report(info.to_string());
+                    return;
+                }
                 restore();
                 default(info);
             }));
         });
+        *OWNER.lock().unwrap_or_else(PoisonError::into_inner) = Some(std::thread::current().id());
         ACTIVE.store(true, Ordering::SeqCst);
         Self::setup(mouse).inspect_err(|_| restore())
     }
@@ -87,6 +99,22 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         restore();
+        let mut reports = REPORTS.lock().unwrap_or_else(PoisonError::into_inner);
+        for report in reports.drain(..) {
+            let _ = writeln!(stderr(), "ruconmd: {report}");
+        }
+    }
+}
+
+fn is_owner() -> bool {
+    let owner = *OWNER.lock().unwrap_or_else(PoisonError::into_inner);
+    owner == Some(std::thread::current().id())
+}
+
+fn report(text: String) {
+    let mut reports = REPORTS.lock().unwrap_or_else(PoisonError::into_inner);
+    if reports.len() < MAX_REPORTS {
+        reports.push(text);
     }
 }
 

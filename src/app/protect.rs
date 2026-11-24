@@ -242,7 +242,8 @@ impl App {
         }
         let mut name = OsString::from(path);
         name.push(".bak");
-        file::write_exact(Path::new(&name), &old, Some(&meta)).map_err(|e| e.to_string())?;
+        file::write_exact(Path::new(&name), &old, Some((path, &meta)))
+            .map_err(|e| e.to_string())?;
         self.backed_up.insert(real);
         Ok(())
     }

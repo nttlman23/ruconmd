@@ -107,6 +107,13 @@ impl Home {
     }
 
     fn start(&self, args: &[&str]) -> Session {
+        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_ruconmd"));
+        command.args(["--lang", "ru"]);
+        command.args(args);
+        self.spawn(command)
+    }
+
+    fn spawn(&self, mut command: CommandBuilder) -> Session {
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: ROWS,
@@ -115,9 +122,6 @@ impl Home {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_ruconmd"));
-        command.args(["--lang", "ru"]);
-        command.args(args);
         command.cwd(self.dir.path());
         for name in [
             "TMUX",
@@ -870,4 +874,54 @@ mod unix {
         assert!(!s.contains(0, "a=q"), "tmux is not asked");
         s.quit();
     }
+}
+
+const PANIC_RESULT: &str = "RUCONMD_TEST_PANIC_RESULT";
+
+/// Не самостоятельная проверка: её запускает в псевдотерминале следующая.
+#[cfg(unix)]
+#[test]
+#[ignore = "runs inside a pseudoterminal"]
+fn panic_in_another_thread_child() {
+    use ratatui::crossterm::terminal::is_raw_mode_enabled;
+
+    let Some(result) = std::env::var_os(PANIC_RESULT) else {
+        return;
+    };
+    let mut terminal = ruconmd::term::Terminal::enter(false).unwrap();
+    terminal.draw(|_| {}).unwrap();
+    assert!(thread::spawn(|| panic!("broken picture")).join().is_err());
+    let raw = is_raw_mode_enabled().unwrap();
+    terminal.draw(|_| {}).unwrap();
+    print!("[after panic]");
+    std::io::stdout().flush().unwrap();
+    drop(terminal);
+    fs::write(result, format!("{raw} {}", is_raw_mode_enabled().unwrap())).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn panic_in_another_thread_leaves_the_screen_alone() {
+    let home = Home::new();
+    let result = home.path("result");
+    let mut command = CommandBuilder::new(std::env::current_exe().unwrap());
+    command.args([
+        "--exact",
+        "panic_in_another_thread_child",
+        "--ignored",
+        "--nocapture",
+    ]);
+    command.env(PANIC_RESULT, &result);
+    let mut session = home.spawn(command);
+    assert_eq!(session.code(), 0);
+    session.wait_file(&result, "true false");
+    session.wait("сообщение о панике", |s| {
+        s.contains(0, "broken picture")
+    });
+    let raw = session.raw();
+    let find = |what: &[u8]| raw.windows(what.len()).position(|w| w == what).unwrap();
+    let (marker, leave) = (find(b"[after panic]"), find(b"\x1b[?1049l"));
+    let message = find(b"broken picture");
+    assert!(marker < leave, "the screen was left because of the panic");
+    assert!(leave < message, "the message came over the screen");
 }

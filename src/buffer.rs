@@ -401,11 +401,12 @@ impl Buffer {
         }
     }
 
-    /// Заменяет диапазон одним шагом отмены. Место курсора и начала выделения
-    /// задаётся в новом тексте, без него курсор встаёт за вставленным.
+    /// Заменяет диапазон одним шагом отмены. Текст вставляется как есть: в нём
+    /// бывают куски документа, переводы строк которых менять нельзя. Место курсора
+    /// и начала выделения задаётся в новом тексте, без него курсор встаёт за
+    /// вставленным.
     pub fn edit(&mut self, range: Range<usize>, text: &str, place: Option<(Option<usize>, usize)>) {
-        let text = self.with_document_eol(text);
-        self.replace(range, text, Kind::Other, false);
+        self.replace(range, text.to_owned(), Kind::Other, false);
         if let Some((anchor, cursor)) = place {
             self.anchor = anchor.map(|a| a.min(self.len()));
             self.cursor = cursor.min(self.len());

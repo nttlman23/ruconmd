@@ -4,6 +4,8 @@ use std::ops::Range;
 
 use regex::{NoExpand, Regex, RegexBuilder, Replacer};
 
+use crate::buffer::Eol;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Query {
     pub text: String,
@@ -48,15 +50,21 @@ impl Search {
     }
 
     /// Чем заменить совпадение. В режиме regex доступны группы `$1`, `${имя}`
-    /// и обозначения `\n`, `\t`.
-    pub fn replacement(&self, text: &str, hit: &Range<usize>, with: &str) -> Option<String> {
+    /// и обозначения `\n` (перевод строки вида `eol`), `\t`.
+    pub fn replacement(
+        &self,
+        text: &str,
+        hit: &Range<usize>,
+        with: &str,
+        eol: Eol,
+    ) -> Option<String> {
         let captures = self.regex.captures_at(text, hit.start)?;
         if captures.get(0)?.range() != *hit {
             return None;
         }
         let mut out = String::new();
         if self.query.regex {
-            captures.expand(&unescape(with), &mut out);
+            captures.expand(&unescape(with, eol), &mut out);
         } else {
             NoExpand(with).replace_append(&captures, &mut out);
         }
@@ -69,10 +77,11 @@ impl Search {
         &self,
         text: &str,
         with: &str,
+        eol: Eol,
         accept: impl Fn(&Range<usize>) -> bool,
     ) -> Option<(Range<usize>, String, usize)> {
         let with = if self.query.regex {
-            unescape(with)
+            unescape(with, eol)
         } else {
             with.to_owned()
         };
@@ -105,13 +114,13 @@ fn brief(error: &regex::Error) -> String {
     line.trim_start_matches("error: ").to_owned()
 }
 
-fn unescape(text: &str) -> String {
+fn unescape(text: &str, eol: Eol) -> String {
     let mut out = String::new();
     let mut chars = text.chars();
     while let Some(c) = chars.next() {
         match c {
             '\\' => match chars.next() {
-                Some('n') => out.push('\n'),
+                Some('n') => out.push_str(eol.as_str()),
                 Some('t') => out.push('\t'),
                 Some('\\') => out.push('\\'),
                 Some(other) => out.extend(['\\', other]),
@@ -167,12 +176,18 @@ mod tests {
     fn replacements() {
         let s = search(r"(\w+)@(\w+)", false, true);
         let hit = s.next("x a@b", 0).unwrap();
-        assert_eq!(s.replacement("x a@b", &hit, "$2\\n$1").unwrap(), "b\na");
+        let lf = s.replacement("x a@b", &hit, "$2\\n$1", Eol::Lf);
+        assert_eq!(lf.unwrap(), "b\na");
+        let crlf = s.replacement("x a@b", &hit, "$2\\n$1", Eol::Crlf);
+        assert_eq!(crlf.unwrap(), "b\r\na");
         let s = search("a", false, false);
-        assert_eq!(s.replacement("a", &(0..1), "$1\\n").unwrap(), "$1\\n");
-        let (span, out, count) = s.replace_all("xaxaxa", "aa", |r| r.start > 1).unwrap();
+        let literal = s.replacement("a", &(0..1), "$1\\n", Eol::Lf);
+        assert_eq!(literal.unwrap(), "$1\\n");
+        let (span, out, count) = s
+            .replace_all("xaxaxa", "aa", Eol::Lf, |r| r.start > 1)
+            .unwrap();
         assert_eq!((span, out.as_str(), count), (3..6, "aaxaa", 2));
-        assert!(s.replace_all("zzz", "", |_| true).is_none());
+        assert!(s.replace_all("zzz", "", Eol::Lf, |_| true).is_none());
     }
 
     #[test]

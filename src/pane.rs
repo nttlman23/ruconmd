@@ -40,6 +40,8 @@ pub struct Pane {
     shown: Option<Key>,
     wanted: Option<Key>,
     job: Option<(Key, Receiver<Doc>)>,
+    /// Построить это не удалось, повторять незачем.
+    failed: Option<Key>,
     code: Highlighter,
     /// Подсветка видимого кода не закончена.
     unfinished: bool,
@@ -155,6 +157,7 @@ impl Default for Pane {
             shown: None,
             wanted: None,
             job: None,
+            failed: None,
             code: Highlighter::default(),
             unfinished: false,
             top: 0,
@@ -288,7 +291,7 @@ impl Pane {
             width,
         };
         self.wanted = Some(key);
-        if self.shown != Some(key) && self.job.is_none() {
+        if self.shown != Some(key) && self.failed != Some(key) && self.job.is_none() {
             if buffer.byte_len() <= SYNC_BYTES {
                 let images = self.images();
                 let doc = Doc::build(&buffer.text(), width, tab, images.as_ref());
@@ -317,7 +320,11 @@ impl Pane {
                 }
             }
             Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => self.job = None,
+            // Поток построения упал.
+            Err(TryRecvError::Disconnected) => {
+                self.job = None;
+                self.failed = Some(key);
+            }
         }
     }
 
@@ -484,6 +491,11 @@ impl Pane {
         self.shown.is_some() && self.shown == self.wanted
     }
 
+    /// Просмотр текущего текста построить не удалось.
+    pub fn is_failed(&self) -> bool {
+        self.failed.is_some() && self.failed == self.wanted
+    }
+
     /// Нужна повторная отрисовка без участия пользователя.
     pub fn is_busy(&self) -> bool {
         let loading = |p: &Picture| matches!(p, Picture::Loading(_));
@@ -622,6 +634,24 @@ mod tests {
         pane.prepare(&buffer, 40, 10, 4);
         buffer.paste("# Новое\n\n", false);
         wait(&mut pane, &buffer, 40);
+        assert_eq!(top_text(&pane), "Новое");
+    }
+
+    #[test]
+    fn failed_build_is_not_repeated_until_the_text_changes() {
+        let mut buffer = Buffer::new(&paragraphs(20_000));
+        let mut pane = Pane::default();
+        pane.prepare(&buffer, 40, 10, 4);
+        // Упавший поток оставляет канал без отправителя.
+        let (key, _) = pane.job.take().unwrap();
+        pane.job = Some((key, channel().1));
+        for _ in 0..3 {
+            pane.prepare(&buffer, 40, 10, 4);
+            assert!(pane.is_failed() && !pane.is_ready() && !pane.is_busy());
+        }
+        buffer.paste("# Новое\n\n", false);
+        wait(&mut pane, &buffer, 40);
+        assert!(!pane.is_failed());
         assert_eq!(top_text(&pane), "Новое");
     }
 

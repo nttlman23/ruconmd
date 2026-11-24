@@ -281,7 +281,7 @@ fn footer_text(app: &App) -> String {
     }
     let s = app.lang.strings();
     if app.mode == Mode::View && !app.pane.is_ready() {
-        return format!(" {mode} | {}", s.preparing);
+        return format!(" {mode} | {}", app.preview_note());
     }
     if app.mode == Mode::View {
         match app.pane.selected_item() {

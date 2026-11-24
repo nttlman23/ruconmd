@@ -104,7 +104,7 @@ impl App {
         let found = match self.mode {
             Mode::Edit => self.find_in_text(forward),
             Mode::View if !self.pane.is_ready() => {
-                self.message = Some(self.lang.strings().preparing.into());
+                self.message = Some(self.preview_note().into());
                 return;
             }
             Mode::View => {
@@ -227,7 +227,8 @@ impl App {
     fn replace_one(&mut self, state: &mut Replacing) {
         let Some(search) = &self.search else { return };
         let text = self.buffer.text();
-        let Some(new) = search.replacement(&text, &state.hit, &state.with) else {
+        let eol = self.buffer.ends.eol;
+        let Some(new) = search.replacement(&text, &state.hit, &state.with, eol) else {
             return;
         };
         state.was_empty_hit = state.hit.is_empty();
@@ -278,7 +279,8 @@ impl App {
                 hit.start >= current || hit.start < start
             }
         };
-        if let Some((range, new, count)) = search.replace_all(&text, &state.with, accept) {
+        let eol = self.buffer.ends.eol;
+        if let Some((range, new, count)) = search.replace_all(&text, &state.with, eol, accept) {
             let start = self.buffer.pos_of_byte(range.start);
             let end = self.buffer.pos_of_byte(range.end);
             self.buffer.edit(start..end, &new, None);

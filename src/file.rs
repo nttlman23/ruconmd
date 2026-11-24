@@ -43,7 +43,8 @@ pub fn read_with_meta(path: &Path) -> Result<Option<(Vec<u8>, fs::Metadata)>, Re
 /// Записывает файл так, чтобы сбой не оставил его наполовину записанным.
 ///
 /// Новое содержимое пишется рядом и переименовывается. Если так нельзя сохранить
-/// владельца или жёсткие ссылки либо создать файл в каталоге, запись идёт на место.
+/// владельца, список доступа (ACL), расширенные атрибуты или жёсткие ссылки либо
+/// создать файл в каталоге, запись идёт на место.
 pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let target = resolve(path)?;
     match fs::metadata(&target) {
@@ -71,16 +72,23 @@ pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Записывает файл точно по этому пути: символическая ссылка заменяется, а не
-/// проходится. Права берутся у `like`.
-pub fn write_exact(path: &Path, bytes: &[u8], like: Option<&fs::Metadata>) -> io::Result<()> {
+/// проходится. Права берутся у файла `like`.
+pub fn write_exact(
+    path: &Path,
+    bytes: &[u8],
+    like: Option<(&Path, &fs::Metadata)>,
+) -> io::Result<()> {
     if path.is_dir() {
         return Err(io::Error::other("is a directory"));
     }
     let (mut file, temp) = create_temp(path, true)?;
     let result = (|| {
-        // Владельца может не выйти сменить, для копии достаточно прав.
-        if let Some(like) = like {
-            file.set_permissions(like.permissions())?;
+        // Владельца может не выйти сменить, для копии достаточно прав. Без списка
+        // доступа они значили бы другое, тогда копия видна только владельцу.
+        if let Some((source, meta)) = like
+            && (cfg!(not(unix)) || xattr::copy(source, &file).is_ok())
+        {
+            file.set_permissions(meta.permissions())?;
         }
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -187,7 +195,7 @@ fn replace(target: &Path, bytes: &[u8], old: Option<&fs::Metadata>) -> io::Resul
     let result = (|| {
         // Права ставятся до записи: чужим содержимое не видно ни на миг.
         if let Some(old) = old {
-            copy_attributes(&file, old)?;
+            copy_attributes(target, &file, old)?;
         }
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -234,18 +242,90 @@ fn create_temp(target: &Path, private: bool) -> io::Result<(File, PathBuf)> {
 }
 
 #[cfg(unix)]
-fn copy_attributes(file: &File, old: &fs::Metadata) -> io::Result<()> {
+fn copy_attributes(source: &Path, file: &File, old: &fs::Metadata) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, fchown};
     let new = file.metadata()?;
     if (new.uid(), new.gid()) != (old.uid(), old.gid()) {
         fchown(file, Some(old.uid()), Some(old.gid()))?;
     }
+    // Раньше прав: при списке доступа биты группы означают его маску, без списка
+    // они открыли бы файл группе.
+    xattr::copy(source, file)?;
     file.set_permissions(old.permissions())
 }
 
 #[cfg(not(unix))]
-fn copy_attributes(_: &File, _: &fs::Metadata) -> io::Result<()> {
+fn copy_attributes(_: &Path, _: &File, _: &fs::Metadata) -> io::Result<()> {
     Ok(())
+}
+
+/// Расширенные атрибуты, в том числе списки доступа и метки SELinux.
+#[cfg(target_os = "linux")]
+mod xattr {
+    use std::fs::File;
+    use std::io;
+    use std::path::Path;
+
+    use rustix::fs::{XattrFlags, fgetxattr, fremovexattr, fsetxattr, getxattr, listxattr};
+    use rustix::io::Errno;
+
+    pub const ACL: &[u8] = b"system.posix_acl_access";
+    /// Наибольший размер значения и списка имён в Linux.
+    const MAX: usize = 64 * 1024;
+    /// Ими ведает ядро, у нового содержимого они свои.
+    const KERNEL: [&[u8]; 2] = [b"security.ima", b"security.evm"];
+
+    /// Делает атрибуты `file` такими же, как у `source`. Если не вышло, это отказ
+    /// в доступе, кроме нехватки места.
+    pub fn copy(source: &Path, file: &File) -> io::Result<()> {
+        copy_all(source, file).map_err(|e| match e {
+            Errno::NOSPC | Errno::DQUOT => e.into(),
+            e => io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("extended attributes: {}", io::Error::from(e)),
+            ),
+        })
+    }
+
+    fn copy_all(source: &Path, file: &File) -> rustix::io::Result<()> {
+        let mut names = vec![0; MAX];
+        let len = match listxattr(source, &mut names[..]) {
+            Ok(len) => len,
+            // Файловая система без атрибутов.
+            Err(Errno::OPNOTSUPP | Errno::NOSYS) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let names = || names[..len].split(|b| *b == 0).filter(|n| !n.is_empty());
+        let (mut wanted, mut present) = (vec![0; MAX], vec![0; MAX]);
+        for name in names().filter(|n| !KERNEL.contains(n)) {
+            let len = match getxattr(source, name, &mut wanted[..]) {
+                Ok(len) => len,
+                // Уже удалён.
+                Err(Errno::NODATA) => continue,
+                Err(e) => return Err(e),
+            };
+            let same = fgetxattr(file, name, &mut present[..])
+                .is_ok_and(|n| present[..n] == wanted[..len]);
+            if !same {
+                fsetxattr(file, name, &wanted[..len], XattrFlags::empty())?;
+            }
+        }
+        // Новый файл мог получить список доступа от каталога.
+        if !names().any(|n| n == ACL) {
+            match fremovexattr(file, ACL) {
+                Ok(()) | Err(Errno::NODATA | Errno::OPNOTSUPP | Errno::NOSYS) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod xattr {
+    pub fn copy(_: &std::path::Path, _: &std::fs::File) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn write_in_place(target: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -350,6 +430,90 @@ mod tests {
             fs::write(&path, "old").unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
             write(&path, b"new").unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
+        }
+
+        /// Список доступа: владелец и пользователь 12345 читают и пишут, группа нет.
+        #[cfg(target_os = "linux")]
+        fn acl() -> Vec<u8> {
+            const ANYONE: u32 = u32::MAX;
+            let entries = [
+                (1u16, 6u16, ANYONE),
+                (2, 6, 12345),
+                (4, 0, ANYONE),
+                (16, 6, ANYONE),
+                (32, 0, ANYONE),
+            ];
+            let mut out = 2u32.to_le_bytes().to_vec();
+            for (tag, perm, id) in entries {
+                out.extend(tag.to_le_bytes());
+                out.extend(perm.to_le_bytes());
+                out.extend(id.to_le_bytes());
+            }
+            out
+        }
+
+        #[cfg(target_os = "linux")]
+        fn set(path: &Path, name: &[u8], value: &[u8]) -> bool {
+            use rustix::fs::{XattrFlags, setxattr};
+            match setxattr(path, name, value, XattrFlags::empty()) {
+                Ok(()) => true,
+                // Файловая система так не умеет, проверять нечего.
+                Err(rustix::io::Errno::OPNOTSUPP) => false,
+                Err(e) => panic!("{e}"),
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        fn get(path: &Path, name: &[u8]) -> Option<Vec<u8>> {
+            let mut value = vec![0; 1024];
+            let len = rustix::fs::getxattr(path, name, &mut value[..]).ok()?;
+            value.truncate(len);
+            Some(value)
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn keeps_access_lists_and_attributes() {
+            let dir = dir();
+            let path = dir.path().join("a.md");
+            fs::write(&path, "old").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let inode = fs::metadata(&path).unwrap().ino();
+            let with_acl = set(&path, xattr::ACL, &acl());
+            let with_user = set(&path, b"user.note", b"value");
+            write(&path, b"new").unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"new");
+            let meta = fs::metadata(&path).unwrap();
+            assert_ne!(meta.ino(), inode, "still replaced, not written in place");
+            if with_acl {
+                // Биты группы 6: маска, самой группе доступ закрыт.
+                assert_eq!(meta.mode() & 0o777, 0o660);
+                assert_eq!(get(&path, xattr::ACL), Some(acl()));
+            }
+            if with_user {
+                assert_eq!(get(&path, b"user.note").unwrap(), b"value");
+            }
+
+            let copy = dir.path().join("a.md.bak");
+            write_exact(&copy, b"old", Some((&path, &meta))).unwrap();
+            if with_acl {
+                assert_eq!(get(&copy, xattr::ACL), Some(acl()));
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn access_list_of_the_directory_is_not_added() {
+            let dir = dir();
+            let path = dir.path().join("a.md");
+            fs::write(&path, "old").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            if !set(dir.path(), b"system.posix_acl_default", &acl()) {
+                return;
+            }
+            write(&path, b"new").unwrap();
+            assert_eq!(get(&path, xattr::ACL), None);
             assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
         }
 
