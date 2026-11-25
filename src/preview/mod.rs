@@ -116,9 +116,41 @@ pub struct Doc {
     pub order: Vec<(u32, usize)>,
     pub code: Vec<CodeBlock>,
     pub images: Vec<Image>,
+    /// Обычный текст, без разметки.
+    pub plain: bool,
 }
 
 impl Doc {
+    /// Текст как он есть, только с переносом длинных строк.
+    pub fn plain(text: &str, width: usize, tab: usize) -> Self {
+        let mut doc = Self {
+            plain: true,
+            ..Self::default()
+        };
+        let mut src = 0;
+        for full in text.split_inclusive('\n') {
+            let line = full.strip_suffix('\n').unwrap_or(full);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            for (number, row) in layout::rows(line, Some(width.max(1)), tab)
+                .into_iter()
+                .enumerate()
+            {
+                let part = &line[row.byte_start..row.byte_end];
+                doc.lines.push(Line {
+                    spans: vec![Span::new(part, Mark::TEXT)],
+                    prefix: 0,
+                    // Пробел на месте переноса остаётся в строке.
+                    join: if number == 0 { Join::New } else { Join::Glue },
+                    code: None,
+                    image: None,
+                    src: src + row.byte_start,
+                });
+            }
+            src += full.len();
+        }
+        doc
+    }
+
     /// `images`: `None`, если терминал не показывает картинки.
     pub fn build(text: &str, width: usize, tab: usize, images: Option<&Images>) -> Self {
         let mut builder = Builder::new(width.max(1), tab, images);
@@ -141,6 +173,10 @@ impl Doc {
             .lines
             .partition_point(|l| l.src <= src)
             .saturating_sub(1);
+        // В обычном тексте каждая строка сама по себе, и пустая тоже.
+        if self.plain {
+            return line;
+        }
         // Блок начинается с первой непустой строки с тем же местом.
         while line > 0
             && self.lines[line - 1].src == self.lines[line].src

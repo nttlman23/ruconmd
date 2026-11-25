@@ -22,8 +22,13 @@ impl App {
     }
 
     pub(super) fn ask_outline(&mut self) {
-        let headings = preview::headings(&self.buffer.text());
         let s = self.lang.strings();
+        // В обычном тексте заголовков нет.
+        let plain = self.mode == Mode::View && self.pane.is_plain();
+        let headings = match plain {
+            true => Vec::new(),
+            false => preview::headings(&self.buffer.text()),
+        };
         if headings.is_empty() {
             self.message = Some(s.no_headings.into());
             return;

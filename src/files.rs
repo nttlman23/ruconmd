@@ -8,7 +8,7 @@ use std::time::SystemTime;
 /// Столько записей каталога читается и столько показывается.
 const MAX_SCAN: usize = 50_000;
 const MAX_SHOWN: usize = 5_000;
-const EXTENSIONS: [&str; 5] = ["md", "markdown", "mdown", "mkd", "txt"];
+const MARKDOWN: [&str; 4] = ["md", "markdown", "mdown", "mkd"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -52,9 +52,17 @@ fn modified(dir: &Path) -> Option<SystemTime> {
     fs::metadata(dir).and_then(|m| m.modified()).ok()
 }
 
+fn extension(path: &Path) -> Option<String> {
+    Some(path.extension()?.to_string_lossy().to_lowercase())
+}
+
+/// Markdown ли это, судя по имени файла.
+pub fn is_markdown(path: &Path) -> bool {
+    extension(path).is_some_and(|e| MARKDOWN.contains(&e.as_str()))
+}
+
 fn is_text(path: &Path) -> bool {
-    let extension = path.extension().map(|e| e.to_string_lossy().to_lowercase());
-    extension.is_some_and(|e| EXTENSIONS.contains(&e.as_str()))
+    is_markdown(path) || extension(path).is_some_and(|e| e == "txt")
 }
 
 #[cfg(windows)]
@@ -565,6 +573,18 @@ mod tests {
         let t = tree(&dir);
         assert_eq!(t.rows.len(), MAX_SHOWN + 2);
         assert_eq!(t.rows.last().unwrap().kind, Kind::Cut);
+    }
+
+    #[test]
+    fn markdown_is_told_by_the_name() {
+        for name in ["a.md", "A.MD", "дир.txt/б.markdown", "c.mdown", "d.mkd"] {
+            assert!(is_markdown(Path::new(name)), "{name}");
+        }
+        for name in [
+            "a.txt", "README", ".md", "a.md.bak", "a.mdx", "md", "a.toml",
+        ] {
+            assert!(!is_markdown(Path::new(name)), "{name}");
+        }
     }
 
     #[test]

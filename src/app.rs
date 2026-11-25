@@ -2397,6 +2397,61 @@ mod tests {
     }
 
     #[test]
+    fn other_files_are_shown_as_plain_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "# раз\n\n- [ ] дело\n[a](b.md)\n";
+        let shown = |app: &App| -> Vec<String> {
+            let lines = app.pane.visible().iter();
+            let text = |l: &crate::preview::Line| l.spans.iter().map(|s| &*s.text).collect();
+            lines.map(text).collect()
+        };
+        for name in ["a.txt", "Makefile", "a.toml"] {
+            let path = dir.path().join(name);
+            fs::write(&path, text).unwrap();
+            let mut app = open(Some(path), None);
+            press(&mut app, "f5");
+            assert_eq!(shown(&app).join("\n") + "\n", text, "{name}");
+            // Отмечать, выбирать и оглавлять нечего.
+            press(&mut app, "tab space ctrl+t");
+            assert!(!app.is_modified() && app.dialog.is_none());
+            search_for(&mut app, "ctrl+f", "дело");
+            assert_eq!(app.message.as_deref(), Some("1 of 1"));
+            press(&mut app, "f5");
+            assert_eq!(app.buffer.text(), text);
+        }
+        // Тот же текст под именем Markdown оформляется.
+        let mut app = open(Some(dir.path().join("a.txt")), None);
+        press(&mut app, "f5");
+        let md = dir.path().join("A.MD");
+        app.submit(Ask::SavePath(Then::Stay), md.to_str().unwrap().into());
+        draw(&mut app);
+        assert!(shown(&app)[0] == "раз" && !shown(&app).join("").contains("[ ]"));
+        press(&mut app, "ctrl+t");
+        assert!(app.dialog.is_some());
+        // И безымянный документ тоже.
+        let mut app = with_text(text);
+        press(&mut app, "f5");
+        assert_eq!(shown(&app)[0], "раз");
+    }
+
+    #[test]
+    fn mode_switch_keeps_the_place_in_plain_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        let text: String = (0..200).map(|i| format!("строка {i}\n\n")).collect();
+        fs::write(&path, &text).unwrap();
+        let mut app = open(Some(path), None);
+        app.goto_line(101);
+        draw(&mut app);
+        let top = app.view.top.line;
+        press(&mut app, "f5");
+        let src = app.pane.source_at_top();
+        assert_eq!(app.buffer.line_of(app.buffer.pos_of_byte(src)), top);
+        press(&mut app, "down f5");
+        assert_eq!(app.view.top.line, top + 1, "blank lines count too");
+    }
+
+    #[test]
     fn line_numbers_key_is_remembered() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = in_directory(dir.path());

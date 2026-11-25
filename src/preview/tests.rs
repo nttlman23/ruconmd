@@ -426,3 +426,51 @@ mod images {
         }
     }
 }
+
+#[test]
+fn plain_text_is_shown_as_it_is() {
+    let text = "# не заголовок\r\n\r\n- [ ] **не** [ссылка](a.md)\n\n\tотступ  два\n$x^2$";
+    let doc = Doc::plain(text, 60, 4);
+    let lines: Vec<String> = doc
+        .lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "# не заголовок",
+            "",
+            "- [ ] **не** [ссылка](a.md)",
+            "",
+            "\tотступ  два",
+            "$x^2$"
+        ]
+    );
+    assert!(doc.items.is_empty() && doc.code.is_empty() && doc.images.is_empty());
+    let marks = doc.lines.iter().flat_map(|l| &l.spans).map(|s| s.mark);
+    assert!(marks.into_iter().all(|m| m == Mark::TEXT));
+    // Место в тексте находится точно, в том числе у пустых строк.
+    for (number, line) in doc.lines.iter().enumerate() {
+        assert_eq!(doc.line_at(line.src), number);
+    }
+    assert!(text[doc.lines[4].src..].starts_with("\tотступ"));
+    assert!(Doc::plain("", 60, 4).lines.is_empty());
+}
+
+#[test]
+fn plain_text_is_wrapped_without_losses() {
+    let text = "раз два три четыре пять\nдлинноеслововширинуокна 日本語\n";
+    for width in 1..30 {
+        let doc = Doc::plain(text, width, 4);
+        let mut whole = String::new();
+        for line in &doc.lines {
+            if line.join == Join::New && !whole.is_empty() {
+                whole.push('\n');
+            }
+            whole.extend(line.spans.iter().map(|s| s.text.as_str()));
+        }
+        assert_eq!(whole, text.trim_end());
+        assert!(doc.lines.is_sorted_by_key(|l| l.src));
+    }
+}

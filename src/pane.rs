@@ -11,6 +11,7 @@ use ropey::Rope;
 
 use crate::buffer::Buffer;
 use crate::code::Highlighter;
+use crate::files::is_markdown;
 use crate::graphics::{Graphics, Images};
 use crate::layout;
 use crate::preview::{Doc, Item, Join, Line};
@@ -175,11 +176,31 @@ impl Default for Pane {
     }
 }
 
-fn spawn(rope: Rope, width: usize, tab: usize, images: Option<Images>) -> Receiver<Doc> {
+/// Из чего строится просмотр, кроме самого текста.
+#[derive(Clone)]
+struct Source {
+    width: usize,
+    tab: usize,
+    images: Option<Images>,
+    /// Файл не Markdown.
+    plain: bool,
+}
+
+impl Source {
+    fn build(&self, text: &str) -> Doc {
+        if self.plain {
+            Doc::plain(text, self.width, self.tab)
+        } else {
+            Doc::build(text, self.width, self.tab, self.images.as_ref())
+        }
+    }
+}
+
+fn spawn(rope: Rope, source: Source) -> Receiver<Doc> {
     let (sender, receiver) = channel();
     std::thread::spawn(move || {
         // Получателя может уже не быть: режим сменили или программу закрыли.
-        let _ = sender.send(Doc::build(&rope.to_string(), width, tab, images.as_ref()));
+        let _ = sender.send(source.build(&rope.to_string()));
     });
     receiver
 }
@@ -200,6 +221,11 @@ impl Pane {
 
     pub fn graphics(&self) -> Option<&Graphics> {
         self.graphics.as_ref()
+    }
+
+    /// Файл показывается обычным текстом. Безымянный документ считается Markdown.
+    pub fn is_plain(&self) -> bool {
+        self.document.as_deref().is_some_and(|d| !is_markdown(d))
     }
 
     fn images(&self) -> Option<Images> {
@@ -294,12 +320,17 @@ impl Pane {
         };
         self.wanted = Some(key);
         if self.shown != Some(key) && self.failed != Some(key) && self.job.is_none() {
+            let source = Source {
+                width,
+                tab,
+                images: self.images(),
+                plain: self.is_plain(),
+            };
             if buffer.byte_len() <= SYNC_BYTES {
-                let images = self.images();
-                let doc = Doc::build(&buffer.text(), width, tab, images.as_ref());
+                let doc = source.build(&buffer.text());
                 self.accept(key, doc);
             } else {
-                self.job = Some((key, spawn(buffer.rope(), width, tab, self.images())));
+                self.job = Some((key, spawn(buffer.rope(), source)));
             }
         }
         self.poll();
