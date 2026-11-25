@@ -846,8 +846,8 @@ mod unix {
         let mut s = home.start(&[arg(&path)]);
         s.wait_for("Найдены несохранённые правки");
         s.send(ENTER);
-        s.wait_for("старое");
-        assert!(s.screen().contains("xy"));
+        // Прежний текст виден и под вопросом, ждать надо восстановленный.
+        s.wait_for("xyстарое");
         s.send(CTRL_S);
         s.wait("сохранение", |_| {
             home.read("a.md").starts_with("xy")
