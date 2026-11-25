@@ -41,6 +41,7 @@ commands! {
     Quit = "quit",
     Files = "files",
     Settings = "settings",
+    LineNumbers = "line_numbers",
     Undo = "undo",
     Redo = "redo",
     Copy = "copy",

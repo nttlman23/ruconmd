@@ -26,6 +26,7 @@ const TAB: &str = "\t";
 const F1: &str = "\x1bOP";
 const F4: &str = "\x1bOS";
 const F5: &str = "\x1b[15~";
+const F6: &str = "\x1b[17~";
 const F9: &str = "\x1b[20~";
 const DOWN: &str = "\x1b[B";
 const RIGHT: &str = "\x1b[C";
@@ -606,6 +607,27 @@ fn settings_are_changed_in_the_program() {
     s.quit();
     let mut s = home.open(&[arg(&path)]);
     assert!(!s.screen().contains("1 строка"));
+    s.quit();
+}
+
+#[test]
+fn line_numbers_are_toggled_and_remembered() {
+    let home = Home::new();
+    let path = home.write("a.md", "строка\n");
+    let mut s = home.open(&[arg(&path)]);
+    s.wait_for("1 строка");
+    s.send(F6);
+    s.wait_for("Номера строк: нет");
+    s.wait_gone("1 строка");
+    s.quit();
+    let mut s = home.open(&[arg(&path)]);
+    s.wait_for("строка");
+    assert!(!s.screen().contains("1 строка"));
+    s.send(F6);
+    s.wait_for("1 строка");
+    s.quit();
+    let mut s = home.open(&[arg(&path)]);
+    s.wait_for("1 строка");
     s.quit();
 }
 

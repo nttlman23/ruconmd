@@ -159,6 +159,7 @@ impl App {
                 | Command::Quit
                 | Command::Help
                 | Command::Settings
+                | Command::LineNumbers
                 | Command::Files),
             ) => self.run(command),
             // Это про текст: сначала переходим к нему.

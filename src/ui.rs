@@ -205,7 +205,18 @@ fn draw_files(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_settings(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
     let s = app.lang.strings();
-    let name_width = |item: &Setting| app.lang.setting(*item).width();
+    // У параметра с клавишей она видна рядом.
+    let title = |item: Setting| {
+        let name = app.lang.setting(item);
+        match item {
+            Setting::LineNumbers => match first_key(app, Command::LineNumbers) {
+                key if key.is_empty() => name.to_owned(),
+                key => format!("{name} ({key})"),
+            },
+            _ => name.to_owned(),
+        }
+    };
+    let name_width = |item: &Setting| title(*item).width();
     let names = Setting::ALL.iter().map(name_width).max().unwrap_or(0);
     const VALUE: usize = 16;
     let width = names + VALUE + 7;
@@ -222,7 +233,7 @@ fn draw_settings(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
         .skip(first)
         .take(rows)
         .map(|(index, item)| {
-            let name = app.lang.setting(*item);
+            let name = title(*item);
             let value = printable(&app.lang.setting_value(*item, &app.values));
             let value = head(&value, VALUE);
             let gap = " ".repeat(names.saturating_sub(name.width()) + 2);
@@ -823,6 +834,7 @@ mod tests {
             "Тема",
             "dark",
             "Панель: ширина",
+            "Номера строк (F6)",
             "Открыть файл настроек",
             "config.toml",
             "Enter: сохранить",

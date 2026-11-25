@@ -404,6 +404,7 @@ impl Lang {
             Command::Quit => ("Выход", "Quit"),
             Command::Files => ("Файлы", "Files"),
             Command::Settings => ("Настройки", "Settings"),
+            Command::LineNumbers => ("Номера строк", "Line numbers"),
             Command::Undo => ("Отменить", "Undo"),
             Command::Redo => ("Повторить", "Redo"),
             Command::Copy => ("Копировать", "Copy"),

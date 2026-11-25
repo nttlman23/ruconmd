@@ -82,31 +82,54 @@ impl App {
             return;
         };
         let s = self.lang.strings();
-        let open = Item::ALL[p.selected] == Item::OpenFile;
         let Some(path) = self.config_path.clone() else {
             self.message = Some(s.settings_no_file.into());
             return;
         };
         if p.before != self.values {
-            let text = match settings::store(&path, &p.before, &self.values) {
+            self.message = Some(match self.store_settings(&p.before) {
                 Ok(()) => {
                     let mut text = format!("{}: {}", s.settings_saved, path.display());
                     if p.before.images != self.values.images {
                         text = format!("{text} ({})", s.settings_images_later);
                     }
-                    Ok(text)
+                    text
                 }
-                Err(StoreError::Damaged) => Err(s.settings_damaged.to_owned()),
-                Err(StoreError::Io(e)) => Err(e.to_string()),
-            };
-            self.message = Some(match &text {
-                Ok(text) => text.clone(),
-                Err(e) => format!("{} {}: {e}", s.not_saved, path.display()),
+                Err(text) => text,
             });
         }
-        if open {
+        if Item::ALL[p.selected] == Item::OpenFile {
             self.open_config(path);
         }
+    }
+
+    /// Записывает в конфиг то, что отличается от `before`. Ошибка: текст для
+    /// пользователя.
+    fn store_settings(&self, before: &Values) -> Result<(), String> {
+        let s = self.lang.strings();
+        let Some(path) = &self.config_path else {
+            return Err(s.settings_no_file.into());
+        };
+        let failed = |reason: &str| format!("{} {}: {reason}", s.not_saved, path.display());
+        settings::store(path, before, &self.values).map_err(|e| match e {
+            StoreError::Damaged => failed(s.settings_damaged),
+            StoreError::Io(e) => failed(&e.to_string()),
+        })
+    }
+
+    /// Показывает или скрывает номера строк и запоминает выбор.
+    pub(super) fn toggle_line_numbers(&mut self) {
+        let before = self.values.clone();
+        let mut values = before.clone();
+        values.line_numbers = !values.line_numbers;
+        self.apply(values);
+        let name = self.lang.setting(Item::LineNumbers);
+        let value = self.lang.setting_value(Item::LineNumbers, &self.values);
+        self.message = Some(match self.store_settings(&before) {
+            Ok(()) => format!("{name}: {value}"),
+            // Действует до конца сеанса.
+            Err(text) => format!("{name}: {value}. {text}"),
+        });
     }
 
     /// Открывает файл настроек, а если его нет, создаёт из образца.

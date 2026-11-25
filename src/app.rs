@@ -660,6 +660,7 @@ impl App {
             Command::Quit => self.should_quit = true,
             Command::Files => self.toggle_files(),
             Command::Settings => self.ask_settings(),
+            Command::LineNumbers => self.toggle_line_numbers(),
             Command::Save => self.save(Then::Stay),
             Command::SaveAs => self.ask_path(Then::Stay),
             Command::Undo => {
@@ -2393,6 +2394,42 @@ mod tests {
         assert!(app.message.as_deref().unwrap().contains("by hand"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "[oops");
         assert_eq!(app.theme, Theme::DARK, "works until the end of the session");
+    }
+
+    #[test]
+    fn line_numbers_key_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = in_directory(dir.path());
+        let path = dir.path().join("cfg").join("config.toml");
+        fs::create_dir(dir.path().join("cfg")).unwrap();
+        let text = "# моё\n[editor]\nwrap = false # так\nline_numbers = true # номера\n";
+        fs::write(&path, text).unwrap();
+        // Клавиша действует и из панели, и в просмотре.
+        assert!(app.files_focused());
+        press(&mut app, "f6");
+        assert!(app.files_focused() && !app.view.settings.line_numbers);
+        assert_eq!(app.message.as_deref(), Some("Line numbers: no"));
+        let hidden = text.replace("numbers = true", "numbers = false");
+        assert_eq!(fs::read_to_string(&path).unwrap(), hidden);
+        let saved = crate::config::parse(&hidden).0;
+        assert!(!saved.editor.line_numbers, "the next session starts so");
+        press(&mut app, "esc f5 f6");
+        assert_eq!(app.message.as_deref(), Some("Line numbers: yes"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        // В диалоге то же значение, и Esc его не отменяет.
+        press(&mut app, "f6 f9 esc");
+        assert!(!app.view.settings.line_numbers);
+        assert!(!app.is_modified());
+        // Не записалось: действует, но об этом сказано.
+        fs::write(&path, "[oops").unwrap();
+        press(&mut app, "f6");
+        assert!(app.view.settings.line_numbers);
+        assert!(app.message.as_deref().unwrap().contains("by hand"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[oops");
+        app.config_path = None;
+        press(&mut app, "f6");
+        assert!(!app.view.settings.line_numbers);
+        assert!(app.message.as_deref().unwrap().contains("No place"));
     }
 
     #[test]
