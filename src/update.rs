@@ -6,7 +6,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use semver::Version;
 use serde_json::Value;
@@ -38,14 +38,16 @@ const PLATFORM: Option<(&str, &[u8])> = if cfg!(all(target_os = "linux", target_
 
 /// Откуда берутся данные. В тестах сети нет.
 trait Source {
-    fn get(&self, url: &str, limit: u64, timeout: Duration) -> Result<Vec<u8>, String>;
+    fn get(&self, url: &str, limit: u64, timeout: Duration) -> Result<Vec<u8>, Failure>;
 }
 
 struct Http;
 
 impl Source for Http {
-    fn get(&self, url: &str, limit: u64, timeout: Duration) -> Result<Vec<u8>, String> {
+    fn get(&self, url: &str, limit: u64, timeout: Duration) -> Result<Vec<u8>, Failure> {
         let agent = ureq::Agent::config_builder()
+            // Причину отказа объясняют заголовки ответа.
+            .http_status_as_error(false)
             .https_only(true)
             .max_redirects(5)
             .timeout_global(Some(timeout))
@@ -54,11 +56,47 @@ impl Source for Http {
             .new_agent();
         // Имя сервера и прокси: из текста самой ошибки не видно, что не нашлось.
         let via = agent.config().proxy().map(|p| (p.host(), p.port()));
-        let explain = |e: ureq::Error| explain(url, via, &e.to_string());
-        let mut response = agent.get(url).call().map_err(explain)?;
+        let network = |error: &str| Failure::Network(explain(url, via, error));
+        let failed = |e: ureq::Error| network(&e.to_string());
+        let mut response = agent.get(url).call().map_err(failed)?;
+        let status = response.status();
+        if !status.is_success() {
+            let header = |name: &str| response.headers().get(name)?.to_str().ok();
+            return Err(match rate_limit(status.as_u16(), header, unix_now()) {
+                Some(wait) => Failure::Limited(wait),
+                None => network(&format!("http status: {}", status.as_u16())),
+            });
+        }
         let body = response.body_mut().with_config().limit(limit);
-        body.read_to_vec().map_err(explain)
+        body.read_to_vec().map_err(failed)
     }
+}
+
+fn unix_now() -> u64 {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH);
+    now.map_or(0, |d| d.as_secs())
+}
+
+/// Отказ ли это из-за числа запросов, и через сколько минут повторить, если
+/// известно. Просто 403 может ответить и прокси.
+fn rate_limit<'a>(
+    status: u16,
+    header: impl Fn(&str) -> Option<&'a str>,
+    now: u64,
+) -> Option<Option<u64>> {
+    /// Больше ждать не предлагается: часы могут быть неверны.
+    const LONGEST: u64 = 24 * 60 * 60;
+    let number = |name| header(name).and_then(|v| v.trim().parse::<u64>().ok());
+    let after = number("retry-after");
+    let exhausted = number("x-ratelimit-remaining") == Some(0);
+    let limited = status == 429 || (status == 403 && (exhausted || after.is_some()));
+    if !limited {
+        return None;
+    }
+    let reset = number("x-ratelimit-reset").filter(|_| exhausted);
+    let seconds = after.or_else(|| reset?.checked_sub(now));
+    let known = seconds.filter(|s| *s <= LONGEST);
+    Some(known.map(|s| s.div_ceil(60).max(1)))
 }
 
 /// Текст ошибки с тем, к чему было обращение. Имя и пароль прокси не выводятся.
@@ -73,6 +111,8 @@ fn explain(url: &str, proxy: Option<(&str, u16)>, error: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Failure {
     Network(String),
+    /// GitHub ограничил число запросов; через сколько минут повторить.
+    Limited(Option<u64>),
     /// Вместо списка выпусков пришло что-то другое.
     BadList,
     /// Файл не тот, что описан в выпуске.
@@ -93,6 +133,7 @@ pub fn run(lang: Lang) -> io::Result<()> {
         Err(failure) => {
             let reason = match failure {
                 Failure::Network(e) => format!("{}: {e}", s.update_network),
+                Failure::Limited(wait) => lang.update_limited(wait),
                 Failure::BadList => s.update_bad_list.to_owned(),
                 Failure::Checksum => s.update_checksum.to_owned(),
                 Failure::Replace(e) => format!("{}: {e}", s.update_replace),
@@ -111,8 +152,7 @@ fn update(
     out: &mut dyn Write,
 ) -> Result<(), Failure> {
     let s = lang.strings();
-    let list = source.get(RELEASES, MAX_LIST, LIST_TIMEOUT);
-    let list = list.map_err(Failure::Network)?;
+    let list = source.get(RELEASES, MAX_LIST, LIST_TIMEOUT)?;
     let Some(version) = newest(&list, current, platform.0)? else {
         // Вывода может не быть, обновлению это не помеха.
         let _ = writeln!(out, "{}: {current}", s.update_none);
@@ -167,8 +207,7 @@ fn download(
     let name = asset_name(version, platform);
     let get = |name: &str, limit| {
         let url = format!("{DOWNLOADS}/v{version}/{name}");
-        let got = source.get(&url, limit, DOWNLOAD_TIMEOUT);
-        got.map_err(Failure::Network)
+        source.get(&url, limit, DOWNLOAD_TIMEOUT)
     };
     let sums = get(SUMS, MAX_SUMS)?;
     let expected = checksum(&sums, &name).ok_or(Failure::Checksum)?;
@@ -269,11 +308,12 @@ mod tests {
     }
 
     impl Source for Fake {
-        fn get(&self, url: &str, limit: u64, _: Duration) -> Result<Vec<u8>, String> {
+        fn get(&self, url: &str, limit: u64, _: Duration) -> Result<Vec<u8>, Failure> {
             self.asked.borrow_mut().push(url.to_owned());
-            let page = self.pages.get(url).ok_or("404")?;
+            let missing = || Failure::Network("404".into());
+            let page = self.pages.get(url).ok_or_else(missing)?;
             if page.len() as u64 > limit {
-                return Err("too big".into());
+                return Err(Failure::Network("too big".into()));
             }
             Ok(page.clone())
         }
@@ -418,6 +458,48 @@ mod tests {
         assert!(matches!(result, Err(Failure::Replace(_))));
         assert_eq!(source.asked.borrow().len(), 1);
         assert_eq!(installed.files(), 0);
+    }
+
+    #[test]
+    fn rate_limit_is_told_from_other_refusals() {
+        const NOW: u64 = 1_800_000_000;
+        let reset = (NOW + 1000).to_string();
+        let past = (NOW - 5).to_string();
+        let far = (NOW + 1_000_000).to_string();
+        let check = |status, headers: &[(&str, &str)]| {
+            let headers: Vec<_> = headers.to_vec();
+            let find = |name: &str| headers.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
+            rate_limit(status, find, NOW)
+        };
+        let (left, until) = ("x-ratelimit-remaining", "x-ratelimit-reset");
+        // Основной предел: 1000 секунд это неполные 17 минут.
+        assert_eq!(check(403, &[(left, "0"), (until, &reset)]), Some(Some(17)));
+        assert_eq!(check(429, &[(left, "0"), (until, &reset)]), Some(Some(17)));
+        // Дополнительный предел называет срок сам.
+        assert_eq!(check(403, &[("retry-after", "60")]), Some(Some(1)));
+        assert_eq!(check(429, &[("retry-after", "0")]), Some(Some(1)));
+        // Срок неизвестен или не похож на правду.
+        assert_eq!(check(429, &[]), Some(None));
+        assert_eq!(check(429, &[("retry-after", "Wed, 21 Oct")]), Some(None));
+        assert_eq!(check(403, &[(left, "0"), (until, &past)]), Some(None));
+        assert_eq!(check(403, &[(left, "0"), (until, &far)]), Some(None));
+        // Другие отказы.
+        assert_eq!(check(403, &[]), None);
+        assert_eq!(check(403, &[(left, "12"), (until, &reset)]), None);
+        assert_eq!(check(404, &[(left, "0"), (until, &reset)]), None);
+        assert_eq!(check(500, &[]), None);
+    }
+
+    #[test]
+    fn rate_limit_is_explained() {
+        let ru = Lang::Ru.update_limited(Some(17));
+        assert!(
+            ru.contains("ограничил") && ru.contains("через 17 мин"),
+            "{ru}"
+        );
+        assert!(Lang::Ru.update_limited(None).contains("позже"));
+        assert!(Lang::En.update_limited(Some(1)).contains("in 1 min"));
+        assert!(Lang::En.update_limited(None).contains("later"));
     }
 
     #[test]

@@ -436,6 +436,26 @@ impl Lang {
 }
 
 impl Lang {
+    /// GitHub ограничил число запросов; через сколько минут повторить.
+    pub fn update_limited(self, minutes: Option<u64>) -> String {
+        match (self, minutes) {
+            (Self::Ru, Some(n)) => {
+                format!(
+                    "GitHub временно ограничил запросы с вашего адреса, повторите через {n} мин"
+                )
+            }
+            (Self::Ru, None) => {
+                "GitHub временно ограничил запросы с вашего адреса, повторите позже".to_owned()
+            }
+            (Self::En, Some(n)) => {
+                format!("GitHub has limited requests from your address, try again in {n} min")
+            }
+            (Self::En, None) => {
+                "GitHub has limited requests from your address, try again later".to_owned()
+            }
+        }
+    }
+
     /// Название параметра в диалоге настроек.
     pub fn setting(self, item: Item) -> &'static str {
         let (ru, en) = match item {
