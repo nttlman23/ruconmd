@@ -6,7 +6,9 @@ use std::path::Path;
 
 use toml_edit::{DocumentMut, Value};
 
+use crate::app::shell::{HEIGHT_MAX, HEIGHT_MIN};
 use crate::config::{Config, FILES_WIDTH, MAX_TAB, MIN_WIDTH};
+use crate::console;
 use crate::file;
 use crate::graphics::Wanted;
 use crate::i18n::Lang;
@@ -35,6 +37,9 @@ pub struct Values {
     pub autosave_delay: u64,
     pub files_all: bool,
     pub files_width: u16,
+    /// Пустая строка: оболочка по умолчанию.
+    pub console_shell: String,
+    pub console_height: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,12 +56,14 @@ pub enum Item {
     AutosaveDelay,
     FilesAll,
     FilesWidth,
+    ConsoleShell,
+    ConsoleHeight,
     /// Открыть сам файл: в нём клавиши и свои темы.
     OpenFile,
 }
 
 impl Item {
-    pub const ALL: [Item; 13] = [
+    pub const ALL: [Item; 15] = [
         Item::Language,
         Item::Theme,
         Item::TabWidth,
@@ -69,6 +76,8 @@ impl Item {
         Item::AutosaveDelay,
         Item::FilesAll,
         Item::FilesWidth,
+        Item::ConsoleShell,
+        Item::ConsoleHeight,
         Item::OpenFile,
     ];
 }
@@ -111,6 +120,8 @@ impl Values {
             autosave_delay: delay.unwrap_or(config.autosave_delay),
             files_all: config.files_all,
             files_width: config.files_width,
+            console_shell: config.console_shell.clone(),
+            console_height: config.console_height,
         }
     }
 
@@ -147,6 +158,17 @@ impl Values {
             Item::FilesWidth => {
                 let all: Vec<u16> = FILES_WIDTH.step_by(FILES_STEP as usize).collect();
                 self.files_width = neighbour(&all, self.files_width, forward);
+            }
+            Item::ConsoleShell => {
+                let mut all = console::known_shells();
+                if !all.contains(&self.console_shell) {
+                    all.push(self.console_shell.clone());
+                }
+                self.console_shell = turn(&all, &self.console_shell, forward);
+            }
+            Item::ConsoleHeight => {
+                let all: Vec<u16> = (HEIGHT_MIN..=HEIGHT_MAX).step_by(10).collect();
+                self.console_height = neighbour(&all, self.console_height, forward);
             }
             Item::OpenFile => {}
         }
@@ -185,6 +207,12 @@ impl Values {
                 Some("files"),
                 "width",
                 number(usize::from(self.files_width)),
+            ),
+            (Some("console"), "shell", self.console_shell.as_str().into()),
+            (
+                Some("console"),
+                "height",
+                number(usize::from(self.console_height)),
             ),
         ]
     }

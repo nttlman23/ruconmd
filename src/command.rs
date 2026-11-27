@@ -42,6 +42,8 @@ commands! {
     Files = "files",
     Settings = "settings",
     LineNumbers = "line_numbers",
+    Console = "console",
+    CloseConsole = "console_close",
     Undo = "undo",
     Redo = "redo",
     Copy = "copy",

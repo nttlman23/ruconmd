@@ -26,6 +26,10 @@ autosave_delay_sec = 5   # 1..3600
 all = false              # true: и скрытое, и файлы любых типов
 width = 30               # ширина панели файлов, 16..80
 
+[console]
+shell = ""               # пусто: $SHELL, в Windows PowerShell; иначе команда
+height = 50              # доля консоли (F7), проценты, 10..90
+
 # Список заменяет клавиши команды целиком, пустой список отключает команду.
 # Модификаторы: ctrl, alt, shift. Клавиши: буквы, f1..f12, space, enter, tab, esc,
 # left, right, up, down, home, end, pageup, pagedown, insert, delete, backspace.
@@ -38,6 +42,8 @@ quit = ["ctrl+q", "f10"]
 files = ["f4", "ctrl+o"]
 settings = ["f9"]
 line_numbers = ["f6"]
+console = ["f7"]
+console_close = ["shift+f7"]
 undo = ["ctrl+z"]
 redo = ["ctrl+y"]
 copy = ["ctrl+c"]

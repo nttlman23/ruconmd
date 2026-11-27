@@ -6,6 +6,7 @@ mod markup;
 mod navigate;
 mod preferences;
 mod protect;
+pub mod shell;
 
 use std::collections::HashSet;
 use std::io;
@@ -41,7 +42,7 @@ const WHEEL_LINES: isize = 3;
 const HIGHLIGHT_BUDGET: Duration = Duration::from_millis(15);
 
 /// Прямоугольник текста на экране, без номеров строк.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TextArea {
     pub x: u16,
     pub y: u16,
@@ -136,6 +137,13 @@ pub struct App {
     bar: Option<TextArea>,
     /// Ползунок тянут мышью.
     bar_drag: bool,
+    console: Option<crate::console::Console>,
+    /// Ввод идёт в консоль.
+    console_focus: bool,
+    split: shell::Split,
+    /// Границу консоли тянут мышью; настройки до этого.
+    split_drag: Option<Values>,
+    waker: Option<shell::Waker>,
 }
 
 struct Loaded {
@@ -248,6 +256,11 @@ impl App {
             covered: false,
             bar: None,
             bar_drag: false,
+            console: None,
+            console_focus: false,
+            split: shell::Split::default(),
+            split_drag: None,
+            waker: None,
         };
         app.pane.reset(app.path.clone());
         app.set_content(loaded);
@@ -404,6 +417,9 @@ impl App {
 
     fn pasted(&mut self, text: &str, continued: bool) {
         self.help = false;
+        if self.console_focused() && self.dialog.is_none() {
+            return self.console_paste(text);
+        }
         let in_files = self.files_focused();
         match &mut self.dialog {
             Some(Dialog::Field(field)) => field.insert(text),
@@ -434,6 +450,9 @@ impl App {
             return self.dialog_outcome(outcome);
         }
         let command = self.keymap.lookup(self.mode, chord);
+        if self.console_focused() {
+            return self.console_key(chord, command);
+        }
         if self.help && command != Some(Command::Quit) {
             self.help = false;
             return;
@@ -541,6 +560,7 @@ impl App {
 
     fn mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
+            _ if self.console_mouse(mouse) => {}
             MouseEventKind::ScrollUp => self.wheel(mouse, -WHEEL_LINES),
             MouseEventKind::ScrollDown => self.wheel(mouse, WHEEL_LINES),
             MouseEventKind::Down(MouseButton::Left) if self.press_files(mouse) => {}
@@ -693,6 +713,8 @@ impl App {
             Command::Files => self.toggle_files(),
             Command::Settings => self.ask_settings(),
             Command::LineNumbers => self.toggle_line_numbers(),
+            Command::Console => self.toggle_console(),
+            Command::CloseConsole => self.close_console(),
             Command::Save => self.save(Then::Stay),
             Command::SaveAs => self.ask_path(Then::Stay),
             Command::Undo => {
@@ -1813,6 +1835,186 @@ mod tests {
         assert!(!app.bar_drag);
     }
 
+    /// Документ с консолью, в которой обычная оболочка.
+    #[cfg(unix)]
+    fn with_console(dir: &Path) -> App {
+        let options = Options {
+            path: Some(dir.join("a.md")),
+            dir: None,
+            mode: Mode::Edit,
+            lang: Lang::En,
+            encoding: None,
+            line: None,
+            config: Config::default(),
+            config_path: Some(dir.join("config.toml")),
+            warnings: Vec::new(),
+            state_dir: None,
+        };
+        fs::write(dir.join("a.md"), "текст\n").unwrap();
+        let mut app =
+            App::open(options, Box::<Local>::default(), Box::<Opened>::default()).unwrap();
+        app.values.console_shell = "/bin/sh".into();
+        app.prepare_console(Some(shell::Split {
+            whole: TextArea {
+                x: 0,
+                y: 1,
+                width: 60,
+                height: 20,
+            },
+            divider: 11,
+            console: TextArea {
+                x: 0,
+                y: 12,
+                width: 60,
+                height: 9,
+            },
+        }));
+        draw(&mut app);
+        app
+    }
+
+    #[cfg(unix)]
+    fn console_shows(app: &mut App, text: &str) {
+        let start = std::time::Instant::now();
+        loop {
+            app.tick(Instant::now());
+            let console = app.console().expect("console is open");
+            if console.screen().screen().contents().contains(text) {
+                return;
+            }
+            assert!(start.elapsed() < Duration::from_secs(20), "{text}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    fn until_closed(app: &mut App) {
+        let start = std::time::Instant::now();
+        while app.has_console() {
+            assert!(start.elapsed() < Duration::from_secs(20));
+            std::thread::sleep(Duration::from_millis(20));
+            app.tick(Instant::now());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn console_gets_keys_and_gives_them_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = with_console(dir.path());
+        press(&mut app, "f7");
+        assert!(app.console_focused());
+        // Всё, кроме F7, уходит оболочке: и буквы, и вставка, и Ctrl+S с Ctrl+Q
+        // (они останавливают и возобновляют вывод, а программу не сохраняют и
+        // не закрывают).
+        type_in(&mut app, "pwd");
+        press(&mut app, "ctrl+s ctrl+q enter");
+        assert!(!app.should_quit);
+        app.handle(Input::Paste {
+            text: "echo вставка\n".into(),
+            continued: false,
+        });
+        console_shows(&mut app, "вставка");
+        let real = dir.path().canonicalize().unwrap();
+        let shown = app.console().unwrap().screen().screen().contents();
+        assert!(shown.contains(real.to_str().unwrap()), "{shown}");
+        assert_eq!(app.buffer.text(), "текст\n");
+        assert!(!app.is_modified());
+        // F7: к документу, консоль остаётся.
+        press(&mut app, "f7");
+        assert!(!app.console_focused() && app.has_console());
+        type_in(&mut app, "x");
+        assert_eq!(app.buffer.text(), "xтекст\n");
+        press(&mut app, "f7");
+        assert!(app.console_focused());
+        // В просмотре консоль та же.
+        press(&mut app, "f7 f5");
+        assert!(app.has_console() && app.mode == Mode::View);
+        press(&mut app, "shift+f7");
+        assert!(!app.has_console() && !app.console_focused());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_closes_the_console() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = with_console(dir.path());
+        press(&mut app, "f7");
+        type_in(&mut app, "exit");
+        press(&mut app, "enter");
+        until_closed(&mut app);
+        assert_eq!(app.message.as_deref(), Some("The console is closed"));
+        type_in(&mut app, "y");
+        assert_eq!(app.buffer.text(), "yтекст\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn console_is_resized_and_clicked_with_the_mouse() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = with_console(dir.path());
+        press(&mut app, "f7 f7");
+        assert_eq!(app.console_height(), 50);
+        // Граница: строка 11. Тянем вверх, консоль растёт.
+        mouse(&mut app, DOWN, 30, 11);
+        mouse(&mut app, DRAG, 30, 5);
+        assert_eq!(app.console_height(), 80);
+        mouse(&mut app, DRAG, 30, 0);
+        assert_eq!(app.console_height(), 90, "the document keeps its share");
+        mouse(&mut app, DRAG, 30, 30);
+        assert_eq!(app.console_height(), 10);
+        mouse(&mut app, DRAG, 30, 17);
+        mouse(&mut app, UP, 30, 17);
+        assert_eq!(app.console_height(), 20);
+        let saved = fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert_eq!(saved.trim(), "[console]\nheight = 20");
+        // Щелчок в консоли передаёт ей ввод, в документе возвращает.
+        assert!(!app.console_focused());
+        mouse(&mut app, DOWN, 5, 15);
+        assert!(app.console_focused());
+        mouse(&mut app, UP, 5, 15);
+        mouse(&mut app, DOWN, 8, 3);
+        assert!(!app.console_focused());
+        // Колесо над консолью прокручивает её, а не документ.
+        let long: String = (0..100).map(|i| format!("строка {i}\n")).collect();
+        app.buffer = Buffer::new(&long);
+        mouse(&mut app, MouseEventKind::ScrollDown, 5, 15);
+        assert_eq!(app.view.top.line, 0);
+        mouse(&mut app, MouseEventKind::ScrollDown, 5, 3);
+        assert_eq!(app.view.top.line, 3, "above it is the document");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn console_and_file_panel_share_the_focus() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = with_console(dir.path());
+        press(&mut app, "f7");
+        press(&mut app, "f7 f4");
+        assert!(app.files_focused() && !app.console_focused());
+        press(&mut app, "f7");
+        assert!(app.console_focused() && !app.files_focused());
+        // Из консоли F4 уходит оболочке.
+        press(&mut app, "f4");
+        assert!(app.console_focused());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_shell_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = with_console(dir.path());
+        // Пустая строка: оболочка по умолчанию.
+        app.values.console_shell = String::new();
+        press(&mut app, "f7");
+        assert!(app.has_console());
+        press(&mut app, "shift+f7");
+        app.values.console_shell = "/nonexistent/shell".into();
+        press(&mut app, "f7");
+        until_closed(&mut app);
+        assert!(app.message.is_some() && !app.console_focused());
+    }
+
     #[test]
     fn mouse_toggles_a_checkbox_in_preview() {
         let mut app = with_text("текст\n\n- [ ] дело\n");
@@ -2571,7 +2773,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = in_directory(dir.path());
         fs::write(dir.path().join("x.png"), "").unwrap();
-        press(&mut app, "f9 end up up right");
+        press(&mut app, "f9 end up up up up right");
         let tree = &app.browser.as_ref().unwrap().tree;
         assert!(tree.visible().any(|(row, _)| row.name == "x.png"));
         press(&mut app, "up up right");

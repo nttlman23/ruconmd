@@ -10,6 +10,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::browse::PanelPlace;
+use crate::app::shell::Split;
 use crate::app::{App, TextArea};
 use crate::buffer::Eol;
 use crate::command::{Command, Mode};
@@ -44,6 +45,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
     frame.buffer_mut().set_style(screen, app.theme.base());
 
+    // Консоль внизу на всю ширину, документ и панель над ней.
+    let middle = body;
+    let (body, split) = split_console(app, body);
+    app.prepare_console(split);
     let work = body;
     let place = app.panel_place(work.width);
     let (panel, body) = match place {
@@ -116,6 +121,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(bar) = bar {
         draw_bar(frame, app, bar);
     }
+    if let Some(split) = split {
+        draw_console(frame, app, split);
+    }
     match &app.dialog {
         Some(Dialog::Field(field)) => draw_field(frame, field, footer),
         Some(Dialog::Replace(_)) => {
@@ -125,9 +133,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         _ => frame.render_widget(Paragraph::new(footer_text(app)).style(BAR), footer),
     }
     match &app.dialog {
-        Some(Dialog::Menu(menu)) => draw_menu(frame, menu, work, app.theme.base()),
-        Some(Dialog::Settings(p)) => draw_settings(frame, app, p.selected, work),
-        _ if app.help => draw_help(frame, app, work),
+        Some(Dialog::Menu(menu)) => draw_menu(frame, menu, middle, app.theme.base()),
+        Some(Dialog::Settings(p)) => draw_settings(frame, app, p.selected, middle),
+        _ if app.help => draw_help(frame, app, middle),
         _ => {}
     }
 }
@@ -359,6 +367,7 @@ fn draw_text(frame: &mut Frame, app: &mut App, area: TextArea, gutter: u16) {
                 && app.dialog.is_none()
                 && !app.help
                 && !app.files_focused()
+                && !app.console_focused()
                 && column >= view.left
             {
                 let x = (area.x as usize + column - view.left).min(right as usize - 1);
@@ -445,6 +454,118 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Делит рабочую область между документом и консолью. Каждому хотя бы строка.
+fn split_console(app: &App, body: Rect) -> (Rect, Option<Split>) {
+    if !app.has_console() || body.height < 3 {
+        return (body, None);
+    }
+    let share = u32::from(app.console_height());
+    let wanted = (u32::from(body.height) * share / 100) as u16;
+    let console = wanted.clamp(1, body.height - 2);
+    let document = body.height - console - 1;
+    let top = Rect {
+        height: document,
+        ..body
+    };
+    let area = |rect: Rect| TextArea {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    };
+    let split = Split {
+        whole: area(body),
+        divider: body.y + document,
+        console: TextArea {
+            y: body.y + document + 1,
+            height: console,
+            ..area(body)
+        },
+    };
+    (top, Some(split))
+}
+
+fn console_color(color: vt100::Color) -> Color {
+    match color {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(n) => Color::Indexed(n),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+fn draw_console(frame: &mut Frame, app: &App, split: Split) {
+    let Some(console) = app.console() else { return };
+    let s = app.lang.strings();
+    let focused = app.console_focused();
+    let line = split.whole;
+    // Граница с названием оболочки; её можно тянуть мышью.
+    let hint = if focused {
+        s.console_back
+    } else {
+        s.console_to
+    };
+    let title = format!(
+        " {}: {} | {hint} ",
+        app.lang.command(Command::Console),
+        printable(&console.title)
+    );
+    let style = match focused {
+        true => BAR,
+        false => app.theme.style(Mark::tone(Tone::Dim)),
+    };
+    let buf = frame.buffer_mut();
+    for x in line.x..line.x + line.width {
+        buf[(x, split.divider)].set_symbol("─").set_style(style);
+    }
+    let room = line.width.saturating_sub(2) as usize;
+    buf.set_string(line.x + 1, split.divider, head(&title, room), style);
+
+    let area = split.console;
+    let parser = console.screen();
+    let screen = parser.screen();
+    let base = app.theme.base();
+    for row in 0..area.height {
+        let mut col = 0;
+        while col < area.width {
+            let (x, y) = (area.x + col, area.y + row);
+            let Some(cell) = screen.cell(row, col) else {
+                buf[(x, y)].set_symbol(" ").set_style(base);
+                col += 1;
+                continue;
+            };
+            let mut style = base
+                .fg(console_color(cell.fgcolor()))
+                .bg(console_color(cell.bgcolor()));
+            for (on, modifier) in [
+                (cell.bold(), Modifier::BOLD),
+                (cell.italic(), Modifier::ITALIC),
+                (cell.underline(), Modifier::UNDERLINED),
+                (cell.inverse(), Modifier::REVERSED),
+                (cell.dim(), Modifier::DIM),
+            ] {
+                if on {
+                    style = style.add_modifier(modifier);
+                }
+            }
+            let text = match cell.contents() {
+                "" => " ".to_owned(),
+                text => printable(text),
+            };
+            let wide = cell.is_wide() && col + 1 < area.width;
+            buf[(x, y)].set_symbol(&text).set_style(style);
+            if wide {
+                buf[(x + 1, y)].set_symbol(" ").set_style(style);
+            }
+            col += if wide { 2 } else { 1 };
+        }
+    }
+    let (row, col) = screen.cursor_position();
+    let cursor_shown = focused && !screen.hide_cursor() && screen.scrollback() == 0;
+    if cursor_shown && row < area.height && col < area.width && app.dialog.is_none() && !app.help {
+        frame.set_cursor_position(Position::new(area.x + col, area.y + row));
+    }
+}
+
 /// Где ползунок на полосе высотой `track`: начало и длина. `None`: всё видно.
 fn thumb(top: usize, height: usize, total: usize, track: usize) -> Option<(usize, usize)> {
     if total <= height || track == 0 {
@@ -491,6 +612,9 @@ fn footer_text(app: &App) -> String {
         return format!(" {mode} | {}", printable(message));
     }
     let s = app.lang.strings();
+    if app.console_focused() {
+        return format!(" {}", s.console_hint);
+    }
     if app.files_focused() {
         return format!(" {}", s.files_hint);
     }

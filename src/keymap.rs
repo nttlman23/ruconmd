@@ -41,6 +41,8 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::Files, &["f4", "ctrl+o"]),
     (Command::Settings, &["f9"]),
     (Command::LineNumbers, &["f6"]),
+    (Command::Console, &["f7"]),
+    (Command::CloseConsole, &["shift+f7"]),
     (Command::Undo, &["ctrl+z"]),
     (Command::Redo, &["ctrl+y"]),
     (Command::Copy, &["ctrl+c"]),

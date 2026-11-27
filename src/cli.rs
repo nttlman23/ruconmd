@@ -106,6 +106,7 @@ fn event_loop(app: &mut App, stop: &AtomicBool) -> io::Result<End> {
     };
     app.set_graphics(graphics::choose(app.wanted_images, &env, answers));
     let events = Events::start();
+    app.set_waker(std::sync::Arc::new(events.waker()));
     let mut drawn = Vec::new();
     while !app.should_quit {
         app.tick(Instant::now());

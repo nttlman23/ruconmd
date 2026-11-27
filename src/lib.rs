@@ -10,6 +10,7 @@ pub mod clipboard;
 pub mod code;
 pub mod command;
 pub mod config;
+pub mod console;
 pub mod diag;
 pub mod dialog;
 pub mod encoding;

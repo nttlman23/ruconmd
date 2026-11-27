@@ -2,7 +2,7 @@
 
 use std::io::{self, Stdout, Write, stderr, stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Mutex, Once, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -195,12 +195,14 @@ impl EventReader {
 /// цикл при этом продолжает работать и успевает записать несохранённые правки.
 pub struct Events {
     receiver: Receiver<io::Result<Batch>>,
+    sender: Sender<io::Result<Batch>>,
 }
 
 impl Events {
     /// Запускается после [`Terminal::enter`]: тот сам читает ответы терминала.
     pub fn start() -> Self {
         let (sender, receiver) = channel();
+        let own = sender.clone();
         std::thread::spawn(move || {
             let mut reader = EventReader::new();
             loop {
@@ -211,7 +213,23 @@ impl Events {
                 }
             }
         });
-        Self { receiver }
+        Self {
+            receiver,
+            sender: own,
+        }
+    }
+
+    /// Будит ожидание [`Events::next`] из другого потока.
+    pub fn waker(&self) -> impl Fn() + Send + Sync + 'static {
+        let sender = Mutex::new(self.sender.clone());
+        move || {
+            let empty = Batch {
+                raw: Vec::new(),
+                inputs: Vec::new(),
+            };
+            let sender = sender.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = sender.send(Ok(empty));
+        }
     }
 
     /// Ждёт ввод не дольше `timeout`.

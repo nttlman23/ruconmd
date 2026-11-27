@@ -27,6 +27,7 @@ const F1: &str = "\x1bOP";
 const F4: &str = "\x1bOS";
 const F5: &str = "\x1b[15~";
 const F6: &str = "\x1b[17~";
+const F7: &str = "\x1b[18~";
 const F9: &str = "\x1b[20~";
 const DOWN: &str = "\x1b[B";
 const RIGHT: &str = "\x1b[C";
@@ -782,6 +783,31 @@ mod unix {
         s.wait_for("чужое третье");
         s.quit();
         assert_eq!(home.read("a.md"), "чужое третье\n");
+    }
+
+    #[test]
+    fn console_runs_commands_beside_the_document() {
+        let mut home = Home::new();
+        home.env.push(("SHELL", "/bin/sh"));
+        let path = home.write("a.md", "документ\n");
+        let mut s = home.open(&[arg(&path)]);
+        s.send(F7);
+        s.wait_for("Консоль: /bin/sh");
+        s.type_text("echo консоль-$((2+3))\r");
+        s.wait_for("консоль-5");
+        // Документ виден над консолью и не изменился.
+        assert!(s.screen().contains("1 документ"));
+        s.send(F7);
+        s.wait_for("F7: в консоль");
+        s.type_text("x");
+        s.wait_for("1 xдокумент");
+        s.send(F7);
+        s.type_text("exit\r");
+        s.wait_for("Консоль закрыта");
+        s.wait_gone("консоль-5");
+        s.send(CTRL_S);
+        s.wait_file(&path, "xдокумент\n");
+        s.quit();
     }
 
     #[test]

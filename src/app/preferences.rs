@@ -105,7 +105,7 @@ impl App {
 
     /// Записывает в конфиг то, что отличается от `before`. Ошибка: текст для
     /// пользователя.
-    fn store_settings(&self, before: &Values) -> Result<(), String> {
+    pub(super) fn store_settings(&self, before: &Values) -> Result<(), String> {
         let s = self.lang.strings();
         let Some(path) = &self.config_path else {
             return Err(s.settings_no_file.into());

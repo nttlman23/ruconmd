@@ -76,6 +76,7 @@ impl App {
             let dir = dir.map_or_else(|| absolute(Path::new(".")), Path::to_owned);
             self.browse(&dir);
         }
+        self.console_focus = false;
         if let Some(b) = &mut self.browser {
             (b.shown, b.focused) = (true, true);
             b.tree.reread();
@@ -160,6 +161,8 @@ impl App {
                 | Command::Help
                 | Command::Settings
                 | Command::LineNumbers
+                | Command::Console
+                | Command::CloseConsole
                 | Command::Files),
             ) => self.run(command),
             // Это про текст: сначала переходим к нему.

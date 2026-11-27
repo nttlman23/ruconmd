@@ -38,6 +38,10 @@ pub struct Config {
     /// Показывать в панели скрытое и файлы любых типов.
     pub files_all: bool,
     pub files_width: u16,
+    /// Пустая строка: оболочка по умолчанию.
+    pub console_shell: String,
+    /// Доля консоли, проценты.
+    pub console_height: u16,
     pub keymap: Keymap,
 }
 
@@ -63,6 +67,8 @@ impl Default for Config {
             autosave_delay: 5,
             files_all: false,
             files_width: 30,
+            console_shell: String::new(),
+            console_height: 50,
             keymap: Keymap::default(),
         }
     }
@@ -190,8 +196,9 @@ impl Reader {
                 ("preview", Value::Table(t)) => self.preview(t),
                 ("save", Value::Table(t)) => self.save(t),
                 ("files", Value::Table(t)) => self.files(t),
+                ("console", Value::Table(t)) => self.console(t),
                 ("keys", Value::Table(t)) => self.keys(t),
-                ("editor" | "preview" | "save" | "files" | "keys" | "themes", _) => {
+                ("editor" | "preview" | "save" | "files" | "console" | "keys" | "themes", _) => {
                     self.warn(key, Problem::BadValue);
                 }
                 _ => self.warn(key, Problem::Unknown),
@@ -264,6 +271,24 @@ impl Reader {
                     let (min, max) = (*FILES_WIDTH.start(), *FILES_WIDTH.end());
                     let width = number(v, min.into(), max.into());
                     self.set(&place, width, |c, n| c.files_width = n as u16);
+                }
+                _ => self.warn(place, Problem::Unknown),
+            }
+        }
+    }
+
+    fn console(&mut self, table: &Table) {
+        use crate::app::shell::{HEIGHT_MAX, HEIGHT_MIN};
+        for (key, v) in table {
+            let place = format!("console.{key}");
+            match key.as_str() {
+                "shell" => {
+                    let shell = v.as_str().map(|s| s.trim().to_owned());
+                    self.set(&place, shell, |c, s| c.console_shell = s);
+                }
+                "height" => {
+                    let height = number(v, HEIGHT_MIN.into(), HEIGHT_MAX.into());
+                    self.set(&place, height, |c, n| c.console_height = n as u16);
                 }
                 _ => self.warn(place, Problem::Unknown),
             }
@@ -430,6 +455,8 @@ mod tests {
         assert_eq!(config.autosave_delay, default.autosave_delay);
         assert_eq!(config.files_all, default.files_all);
         assert_eq!(config.files_width, default.files_width);
+        assert_eq!(config.console_shell, default.console_shell);
+        assert_eq!(config.console_height, default.console_height);
         for command in Command::ALL {
             assert!(
                 EXAMPLE.contains(&format!("\n{} = [", command.name())),

@@ -32,11 +32,14 @@ impl App {
         self.run_autosave(now);
         self.update_recovery(now);
         self.refresh_files(now);
+        self.watch_console();
     }
 
     /// Через сколько вызвать [`App::tick`], если ввода нет.
     pub fn sleep(&self) -> Duration {
-        if self.is_busy() {
+        if self.has_console() {
+            super::shell::CONSOLE_SLEEP
+        } else if self.is_busy() {
             BUSY_SLEEP
         } else {
             MAX_SLEEP

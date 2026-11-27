@@ -42,6 +42,11 @@ pub struct Strings {
     pub read_as: &'static str,
     pub preparing: &'static str,
     pub preview_failed: &'static str,
+    pub console_failed: &'static str,
+    pub console_closed: &'static str,
+    pub console_hint: &'static str,
+    pub console_back: &'static str,
+    pub console_to: &'static str,
     pub files_hint: &'static str,
     pub files_title: &'static str,
     pub files_unreadable: &'static str,
@@ -149,6 +154,11 @@ const RU: Strings = Strings {
     read_as: "Прочитать как",
     preparing: "Готовлю просмотр…",
     preview_failed: "Просмотр построить не удалось",
+    console_failed: "Консоль не запустилась",
+    console_closed: "Консоль закрыта",
+    console_hint: "КОНСОЛЬ | F7: к документу | Shift+F7 или exit: закрыть",
+    console_back: "F7: к документу",
+    console_to: "F7: в консоль",
     files_hint: "ФАЙЛЫ | Enter: открыть | Backspace: каталог выше | Esc: к тексту",
     files_title: "Файлы",
     files_unreadable: "нет доступа",
@@ -256,6 +266,11 @@ const EN: Strings = Strings {
     read_as: "Reread as",
     preparing: "Preparing preview…",
     preview_failed: "Cannot build the preview",
+    console_failed: "Cannot start the console",
+    console_closed: "The console is closed",
+    console_hint: "CONSOLE | F7: to the document | Shift+F7 or exit: close",
+    console_back: "F7: to the document",
+    console_to: "F7: to the console",
     files_hint: "FILES | Enter: open | Backspace: parent | Esc: to the text",
     files_title: "Files",
     files_unreadable: "no access",
@@ -405,6 +420,8 @@ impl Lang {
             Command::Files => ("Файлы", "Files"),
             Command::Settings => ("Настройки", "Settings"),
             Command::LineNumbers => ("Номера строк", "Line numbers"),
+            Command::Console => ("Консоль", "Console"),
+            Command::CloseConsole => ("Закрыть консоль", "Close the console"),
             Command::Undo => ("Отменить", "Undo"),
             Command::Redo => ("Повторить", "Redo"),
             Command::Copy => ("Копировать", "Copy"),
@@ -471,6 +488,8 @@ impl Lang {
             Item::AutosaveDelay => ("Задержка автосохранения", "Autosave delay"),
             Item::FilesAll => ("Панель: все файлы", "Panel: all files"),
             Item::FilesWidth => ("Панель: ширина", "Panel: width"),
+            Item::ConsoleShell => ("Консоль: оболочка", "Console: shell"),
+            Item::ConsoleHeight => ("Консоль: высота, %", "Console: height, %"),
             Item::OpenFile => ("Открыть файл настроек", "Open the settings file"),
         };
         match self {
@@ -505,6 +524,11 @@ impl Lang {
             Item::AutosaveDelay => format!("{} {}", values.autosave_delay, s.seconds),
             Item::FilesAll => flag(values.files_all),
             Item::FilesWidth => values.files_width.to_string(),
+            Item::ConsoleShell if values.console_shell.is_empty() => {
+                format!("{} ({})", s.auto, crate::console::default_shell())
+            }
+            Item::ConsoleShell => values.console_shell.clone(),
+            Item::ConsoleHeight => values.console_height.to_string(),
             Item::OpenFile => String::new(),
         }
     }
