@@ -429,7 +429,9 @@ mod tests {
             flag.store(true, Ordering::SeqCst);
         })
         .unwrap();
-        console.write(b"ls; echo $TERM; echo \xd0\xb3\xd0\xbe\xd1\x82\xd0\xbe\xd0\xb2\xd0\xbe\r");
+        // Ждать надо вывода, а не набранной команды: кавычки внутри слова есть
+        // только в команде.
+        console.write("ls; echo $TERM; echo гото''во\r".as_bytes());
         wait(&console, "готово");
         let shown = console.screen().screen().contents();
         assert!(
@@ -440,11 +442,11 @@ mod tests {
         console.resize(5, 20);
         console.write(b"stty size\r");
         wait(&console, "5 20");
-        console.paste("echo один\necho два\n");
+        console.paste("echo од''ин\necho д''ва\n");
         wait(&console, "два");
         // Прокрутка назад и возврат при вводе.
         for i in 0..30 {
-            console.write(format!("echo строка{i}\r").as_bytes());
+            console.write(format!("echo стро''ка{i}\r").as_bytes());
         }
         wait(&console, "строка29");
         console.scroll(-10);

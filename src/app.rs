@@ -1911,7 +1911,8 @@ mod tests {
         press(&mut app, "ctrl+s ctrl+q enter");
         assert!(!app.should_quit);
         app.handle(Input::Paste {
-            text: "echo вставка\n".into(),
+            // Кавычки внутри слова: ждём вывода, а не набранной команды.
+            text: "echo встав''ка\n".into(),
             continued: false,
         });
         console_shows(&mut app, "вставка");

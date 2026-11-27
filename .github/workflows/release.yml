@@ -36,7 +36,14 @@ jobs:
       - run: rustup default stable && rustup target add ${{ matrix.target }}
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo test --locked --target ${{ matrix.target }}
+      - name: cargo test
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast --target ${{ matrix.target }} 2>&1 | tee test.log
+      # Упавшие тесты видны в сводке без входа в журнал.
+      - name: Report failed tests
+        if: failure()
+        run: if [ -f test.log ]; then python .github/scripts/report_failures.py test.log; fi
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Pack
         run: |
