@@ -132,6 +132,10 @@ pub struct App {
     origin: u16,
     /// Текст закрыт панелью.
     covered: bool,
+    /// Полоса прокрутки просмотра на экране.
+    bar: Option<TextArea>,
+    /// Ползунок тянут мышью.
+    bar_drag: bool,
 }
 
 struct Loaded {
@@ -242,6 +246,8 @@ impl App {
             browser: None,
             origin: 0,
             covered: false,
+            bar: None,
+            bar_drag: false,
         };
         app.pane.reset(app.path.clone());
         app.set_content(loaded);
@@ -351,6 +357,27 @@ impl App {
         let mut shown = self.pane.shown_images();
         shown.retain(|s| self.pane.picture(s.image).is_some());
         shown
+    }
+
+    pub fn set_bar(&mut self, bar: Option<TextArea>) {
+        self.bar = bar;
+    }
+
+    /// Нажатие на полосе прокрутки или протягивание после него. `true`: оно её.
+    fn press_bar(&mut self, mouse: MouseEvent) -> bool {
+        let pressed = matches!(mouse.kind, MouseEventKind::Down(_));
+        let Some(bar) = self.bar.filter(|_| self.mode == Mode::View) else {
+            return false;
+        };
+        let rows = bar.y..bar.y + bar.height;
+        let on_bar = mouse.column == bar.x && rows.contains(&mouse.row);
+        if !self.bar_drag && !(pressed && on_bar && self.dialog.is_none() && !self.help) {
+            return false;
+        }
+        self.bar_drag = true;
+        let row = mouse.row.saturating_sub(bar.y);
+        self.pane.scroll_to_bar(row as usize, bar.height as usize);
+        true
     }
 
     /// Колонка экрана, с которой начинается просмотр.
@@ -517,6 +544,8 @@ impl App {
             MouseEventKind::ScrollUp => self.wheel(mouse, -WHEEL_LINES),
             MouseEventKind::ScrollDown => self.wheel(mouse, WHEEL_LINES),
             MouseEventKind::Down(MouseButton::Left) if self.press_files(mouse) => {}
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+                if self.press_bar(mouse) => {}
             MouseEventKind::Down(MouseButton::Left) if self.mode == Mode::View => {
                 let y = mouse.row.checked_sub(self.area.y);
                 if let Some(y) = y.filter(|y| *y < self.area.height)
@@ -544,7 +573,10 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
                 self.move_to(self.under(mouse), true);
             }
-            MouseEventKind::Up(MouseButton::Left) => self.dragging = false,
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.dragging = false;
+                self.bar_drag = false;
+            }
             _ => {}
         }
     }
@@ -1742,6 +1774,43 @@ mod tests {
         assert!(app.buffer.text().ends_with("- [x] ещё\r\n"));
         press(&mut app, "f5 ctrl+z ctrl+z ctrl+z");
         assert_eq!(app.buffer.text(), text);
+    }
+
+    #[test]
+    fn scrollbar_is_clicked_and_dragged() {
+        let text: String = (0..100).map(|i| format!("абзац {i}\n\n")).collect();
+        let mut app = with_text(&text);
+        press(&mut app, "f5");
+        let bar = TextArea {
+            x: 44,
+            y: 1,
+            width: 1,
+            height: 10,
+        };
+        app.set_bar(Some(bar));
+        let top = |app: &App| app.pane.position().0;
+        mouse(&mut app, DOWN, 44, 10);
+        assert_eq!(app.pane.percent(), Some(100));
+        // Протягивание идёт за мышью и за пределами полосы.
+        mouse(&mut app, DRAG, 20, 1);
+        assert_eq!(top(&app), 0);
+        mouse(&mut app, DRAG, 0, 6);
+        assert!((80..120).contains(&top(&app)), "{}", top(&app));
+        mouse(&mut app, UP, 0, 6);
+        let before = top(&app);
+        mouse(&mut app, DRAG, 44, 1);
+        assert_eq!(top(&app), before, "no longer dragged");
+        // Рядом с полосой: обычное нажатие.
+        mouse(&mut app, DOWN, 43, 1);
+        assert_eq!(top(&app), before);
+        // Под окнами полоса не работает.
+        press(&mut app, "f1");
+        mouse(&mut app, DOWN, 44, 1);
+        assert_eq!(top(&app), before);
+        press(&mut app, "esc f5");
+        mouse(&mut app, DOWN, 44, 1);
+        assert_eq!(app.mode, Mode::Edit);
+        assert!(!app.bar_drag);
     }
 
     #[test]

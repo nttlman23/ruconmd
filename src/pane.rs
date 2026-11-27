@@ -556,6 +556,24 @@ impl Pane {
         self.set_top(self.top.saturating_add_signed(delta));
     }
 
+    /// Положение для полосы прокрутки: верхняя строка, высота экрана и всего строк.
+    pub fn position(&self) -> (usize, usize, usize) {
+        (self.top, self.height, self.doc.lines.len())
+    }
+
+    /// Доля прокрутки от 0 до 100. `None`: документ виден целиком.
+    pub fn percent(&self) -> Option<usize> {
+        let lowest = self.lowest_top();
+        (lowest > 0).then(|| (self.top * 100).div_ceil(lowest).min(100))
+    }
+
+    /// Прокручивает к месту полосы: строка `row` из `rows`.
+    pub fn scroll_to_bar(&mut self, row: usize, rows: usize) {
+        let rows = rows.max(1);
+        let last = rows.saturating_sub(1).max(1);
+        self.set_top(self.lowest_top() * row.min(last) / last);
+    }
+
     pub fn scroll_to_start(&mut self) {
         self.set_top(0);
     }
@@ -711,6 +729,35 @@ mod tests {
         };
         let narrow = shown(2);
         assert_ne!(narrow, shown(8));
+    }
+
+    #[test]
+    fn position_and_percent() {
+        let buffer = Buffer::new(&paragraphs(20));
+        let mut pane = Pane::default();
+        pane.prepare(&buffer, 40, 10, 4);
+        assert_eq!(pane.percent(), Some(0));
+        let (_, height, total) = pane.position();
+        assert_eq!((height, total), (10, 39));
+        pane.scroll(1);
+        assert_eq!(pane.percent(), Some(4), "any move shows");
+        pane.scroll_to_end();
+        assert_eq!(pane.percent(), Some(100));
+        pane.scroll_to_bar(0, 10);
+        assert_eq!(pane.position().0, 0);
+        pane.scroll_to_bar(9, 10);
+        assert_eq!(pane.position().0, 29);
+        pane.scroll_to_bar(99, 10);
+        assert_eq!(pane.position().0, 29);
+        pane.scroll_to_bar(4, 10);
+        assert_eq!(pane.position().0, 12);
+        let small = Buffer::new("коротко\n");
+        let mut pane = Pane::default();
+        pane.prepare(&small, 40, 10, 4);
+        assert_eq!(pane.percent(), None);
+        pane.scroll_to_bar(5, 10);
+        pane.scroll_to_bar(0, 0);
+        assert_eq!(pane.position().0, 0);
     }
 
     #[test]

@@ -24,6 +24,8 @@ use crate::style::{Mark, Tone};
 
 const BAR: Style = Style::new().add_modifier(Modifier::REVERSED);
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
+/// Пустые колонки между текстом просмотра и полосой прокрутки.
+const BAR_GAP: u16 = 1;
 /// Уже этого номера строк не показываются.
 const MIN_TEXT_WIDTH: u16 = 20;
 /// Совпадения поиска.
@@ -78,9 +80,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         height: body.height,
     };
     app.prepare(area);
+    // Последняя колонка просмотра: полоса прокрутки, перед ней пустая.
+    let bar =
+        (app.mode == Mode::View && body.width > MARGIN + BAR_GAP + 1 && !covered).then(|| Rect {
+            x: body.x + body.width - 1,
+            width: 1,
+            ..body
+        });
+    app.set_bar(bar.map(|b| TextArea {
+        x: b.x,
+        y: b.y,
+        width: b.width,
+        height: b.height,
+    }));
     if app.mode == Mode::View {
         app.prepare_preview(
-            body.width.saturating_sub(MARGIN) as usize,
+            body.width.saturating_sub(MARGIN + BAR_GAP + 1) as usize,
             body.height as usize,
         );
     }
@@ -97,6 +112,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Mode::Edit => draw_text(frame, app, area, gutter),
             Mode::View => draw_preview(frame, app, body),
         }
+    }
+    if let Some(bar) = bar {
+        draw_bar(frame, app, bar);
     }
     match &app.dialog {
         Some(Dialog::Field(field)) => draw_field(frame, field, footer),
@@ -427,6 +445,46 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Где ползунок на полосе высотой `track`: начало и длина. `None`: всё видно.
+fn thumb(top: usize, height: usize, total: usize, track: usize) -> Option<(usize, usize)> {
+    if total <= height || track == 0 {
+        return None;
+    }
+    let length = (track * height / total).clamp(1, track);
+    let room = track - length;
+    let lowest = total - height;
+    // Сдвиг на одну строку уже заметен, а в конце ползунок точно внизу.
+    let start = match top.min(lowest) {
+        0 => 0,
+        top if top == lowest => room,
+        top if room < 2 => room * top / lowest,
+        top => (room * top / lowest).clamp(1, room - 1),
+    };
+    Some((start, length))
+}
+
+fn draw_bar(frame: &mut Frame, app: &App, area: Rect) {
+    if !app.pane.is_ready() {
+        return;
+    }
+    let (top, height, total) = app.pane.position();
+    let Some((start, length)) = thumb(top, height, total, area.height as usize) else {
+        return;
+    };
+    let track = app.theme.style(Mark::tone(Tone::Dim));
+    let handle = app.theme.style(Mark::tone(Tone::Heading));
+    let buf = frame.buffer_mut();
+    for row in 0..area.height as usize {
+        let (symbol, style) = match (start..start + length).contains(&row) {
+            true => ("┃", handle),
+            false => ("│", track),
+        };
+        buf[(area.x, area.y + row as u16)]
+            .set_symbol(symbol)
+            .set_style(style);
+    }
+}
+
 fn footer_text(app: &App) -> String {
     let mode = app.lang.mode(app.mode);
     if let Some(message) = &app.message {
@@ -459,11 +517,11 @@ fn footer_text(app: &App) -> String {
         }
         Mode::View => {
             let pos = app.buffer.pos_of_byte(app.pane.source_at_top());
-            format!(
-                "{}/{}",
-                app.buffer.line_of(pos) + 1,
-                app.buffer.line_count()
-            )
+            let line = app.buffer.line_of(pos) + 1;
+            match app.pane.percent() {
+                Some(percent) => format!("{line}/{} {percent}%", app.buffer.line_count()),
+                None => format!("{line}/{}", app.buffer.line_count()),
+            }
         }
     };
     let eol = match (app.buffer.ends.mixed, app.buffer.ends.eol) {
@@ -781,6 +839,78 @@ mod tests {
         assert_eq!(printable("a\x1b[31m\u{202e}\tb"), "a\u{fffd}[31m\u{fffd} b");
         let mut app = app("a\x1b[31mb");
         assert!(screen(&mut app, 40, 4).iter().all(|r| !r.contains('\x1b')));
+    }
+
+    #[test]
+    fn thumb_shows_where_the_screen_is() {
+        assert_eq!(thumb(0, 10, 10, 10), None);
+        assert_eq!(thumb(0, 10, 5, 10), None);
+        assert_eq!(thumb(0, 10, 100, 10), Some((0, 1)));
+        assert_eq!(thumb(90, 10, 100, 10), Some((9, 1)));
+        assert_eq!(thumb(1, 10, 100, 10), Some((1, 1)), "a move shows at once");
+        assert_eq!(
+            thumb(89, 10, 100, 10),
+            Some((8, 1)),
+            "only the end is at the end"
+        );
+        assert_eq!(thumb(45, 10, 100, 10), Some((4, 1)));
+        assert_eq!(thumb(5, 10, 20, 10), Some((2, 5)));
+        assert_eq!(thumb(0, 10, 11, 10), Some((0, 9)));
+        assert_eq!(thumb(1, 10, 11, 10), Some((1, 9)));
+        assert_eq!(thumb(0, 3, 1_000_000, 3), Some((0, 1)));
+        assert_eq!(thumb(500, 3, 1_000_000, 3), Some((1, 1)));
+        assert_eq!(thumb(5, 1, 10, 1), Some((0, 1)));
+        assert_eq!(thumb(0, 0, 10, 0), None);
+    }
+
+    #[test]
+    fn preview_shows_the_scroll_position() {
+        let text: String = (0..100).map(|i| format!("абзац {i}\n\n")).collect();
+        let mut app = app(&text);
+        press(&mut app, "f5");
+        let rows = screen(&mut app, 60, 12);
+        let bar: String = rows[1..11]
+            .iter()
+            .map(|r| r.chars().last().unwrap())
+            .collect();
+        assert_eq!(bar, "┃│││││││││");
+        assert!(rows[11].contains("1/201 0%"), "{}", rows[11]);
+        press(&mut app, "pagedown");
+        let rows = screen(&mut app, 60, 12);
+        let bar: String = rows[1..11]
+            .iter()
+            .map(|r| r.chars().last().unwrap())
+            .collect();
+        assert_eq!(bar, "│┃││││││││");
+        assert!(rows[11].contains("/201 5%"), "{}", rows[11]);
+        press(&mut app, "end");
+        let rows = screen(&mut app, 60, 12);
+        assert!(rows[10].ends_with('┃') && rows[11].contains(" 100%"));
+        // Текст до полосы не доходит.
+        // Слово без пробелов заполняет строку до конца.
+        let long = format!("{}\n", "ж".repeat(200));
+        let mut app = self::app(&long);
+        press(&mut app, "f5");
+        let rows = screen(&mut app, 30, 6);
+        // Текст отделён от полосы пустой колонкой.
+        let gap = |r: &String| r.chars().rev().nth(1);
+        assert!(rows[1..5].iter().all(|r| gap(r) == Some(' ')), "{rows:?}");
+        let mut app = self::app("коротко\n");
+        press(&mut app, "f5");
+        let rows = screen(&mut app, 30, 6);
+        assert!(
+            !rows[5].contains('%') && !rows.join("").contains('┃'),
+            "all is visible"
+        );
+        // В правке полосы нет.
+        press(&mut app, "f5");
+        let rows = screen(&mut app, 30, 6);
+        assert!(!rows.join("").contains('┃'));
+        for (width, height) in [(1, 3), (2, 3), (3, 3), (5, 1)] {
+            press(&mut app, "f5");
+            screen(&mut app, width, height);
+            press(&mut app, "f5");
+        }
     }
 
     #[test]
